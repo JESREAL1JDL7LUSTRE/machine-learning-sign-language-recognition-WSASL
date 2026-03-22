@@ -46,7 +46,8 @@ def resample_dataset(X, target_len=64):
 
 # ── Run directly ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    OUTPUT_DIR = "../output"
+    ROOT       = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    OUTPUT_DIR = os.path.join(ROOT, "output")
     TARGET_LEN = 64
 
     # Try to load normalized first, fall back to raw

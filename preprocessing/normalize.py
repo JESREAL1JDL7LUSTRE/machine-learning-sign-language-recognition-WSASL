@@ -123,7 +123,8 @@ def clean_missing_keypoints(skeleton, strategy="interpolate"):
 
 # ── Run directly ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    OUTPUT_DIR = "../output"
+    ROOT       = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    OUTPUT_DIR = os.path.join(ROOT, "output")
 
     X_raw_path = os.path.join(OUTPUT_DIR, "X_raw.npy")
 

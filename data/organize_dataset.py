@@ -36,8 +36,8 @@ from tqdm import tqdm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ROOT        = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-JSON_PATH   = os.path.join(ROOT, "data", "WLASL_v0.3.json")
-VIDEOS_DIR  = os.path.join(ROOT, "data", "videos")
+JSON_PATH   = os.path.join(ROOT, "dataset", "WLASL_v0.3.json")
+VIDEOS_DIR  = os.path.join(ROOT, "dataset", "videos")
 DATASET_DIR = os.path.join(ROOT, "dataset")
 
 
