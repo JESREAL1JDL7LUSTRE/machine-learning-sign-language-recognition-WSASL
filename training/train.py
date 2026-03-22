@@ -9,33 +9,31 @@ from sklearn.model_selection import train_test_split
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from models.stgcn     import STGCN, keypoints_to_graph
-from training.dataset import SignDataset
+from models.stgcn import STGCN
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR    = os.path.join(ROOT, "output")
 MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn.pth")
 
 BATCH_SIZE    = 16
-EPOCHS        = 100
+EPOCHS        = 200
 LEARNING_RATE = 0.001
-DROPOUT       = 0.3
+DROPOUT       = 0.5
 SEED          = 42
 
-TRAIN_SPLIT   = 0.70
-VAL_SPLIT     = 0.15
-TEST_SPLIT    = 0.15
+TRAIN_SPLIT   = 0.80
+VAL_SPLIT     = 0.10
+TEST_SPLIT    = 0.10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 
-# ── ST-GCN Dataset wrapper ────────────────────────────────────────────────────
+# ── Dataset ───────────────────────────────────────────────────────────────────
 class STGCNDataset(Dataset):
     """
-    Wraps flat (N, T, 150) keypoints and converts each sample
-    to ST-GCN graph format (2, T, 75) on the fly.
-    Also applies augmentation if requested.
+    Converts flat (T, F) keypoints → (2, T, V) graph format on the fly.
+    F = features (102 or 150), V = F // 2 joints.
     """
 
     def __init__(self, X, y, augment=False):
@@ -47,16 +45,16 @@ class STGCNDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        x = self.X[idx].copy()   # (T, 150)
+        x = self.X[idx].copy()   # (T, F)
 
         if self.augment:
-            # Noise injection
+            # Gaussian noise
             if np.random.rand() < 0.5:
                 x += np.random.randn(*x.shape).astype(np.float32) * 0.01
-            # Horizontal flip (negate x coords — every other value)
+            # Horizontal flip (negate x = even indices)
             if np.random.rand() < 0.5:
                 x[:, 0::2] = -x[:, 0::2]
-            # Random frame drop + resample
+            # Random frame drop
             if np.random.rand() < 0.3:
                 T    = len(x)
                 mask = np.random.rand(T) > 0.1
@@ -64,14 +62,22 @@ class STGCNDataset(Dataset):
                 if len(kept) >= 2:
                     idx2 = np.linspace(0, len(kept)-1, T).astype(int)
                     x    = kept[idx2]
+            # Time warp
+            if np.random.rand() < 0.3:
+                T     = len(x)
+                warp  = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
+                warp  = (warp / warp[-1] * (T - 1)).astype(int)
+                warp  = np.clip(warp, 0, T - 1)
+                x     = x[warp]
 
-        # (T, 150) → (T, 75, 2) → (2, T, 75)
-        T = x.shape[0]
-        x_graph = x.reshape(T, 75, 2).transpose(2, 0, 1)   # (2, T, 75)
+        # (T, F) → (T, V, 2) → (2, T, V)
+        T, F = x.shape
+        V    = F // 2
+        x_graph = x.reshape(T, V, 2).transpose(2, 0, 1)   # (2, T, V)
 
         return (
-            torch.tensor(x_graph,       dtype=torch.float32),
-            torch.tensor(self.y[idx],   dtype=torch.long)
+            torch.tensor(x_graph,     dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.long)
         )
 
 
@@ -92,21 +98,19 @@ def load_data():
         )
 
     y = np.load(os.path.join(OUTPUT_DIR, "y.npy"))
-    print(f"   X shape : {X.shape}   y shape : {y.shape}")
-
-    if X.shape[2] != 150:
-        raise ValueError(
-            f"ST-GCN requires MediaPipe features (150), got {X.shape[2]}.\n"
-            "Re-run: python preprocessing/extract.py 20  (default = mediapipe)"
-        )
+    print(f"   X shape  : {X.shape}")
+    print(f"   y shape  : {y.shape}")
+    print(f"   Features : {X.shape[2]} → {X.shape[2]//2} joints per frame")
     return X, y
 
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 def train():
-    X, y = load_data()
+    X, y        = load_data()
     num_classes = len(np.unique(y))
-    print(f"   Classes : {num_classes}")
+    num_joints  = X.shape[2] // 2    # 51 if normalized, 75 if raw
+    print(f"   Classes  : {num_classes}")
+    print(f"   Joints   : {num_joints}")
 
     # 70 / 15 / 15 split
     X_tv, X_test, y_tv, y_test = train_test_split(
@@ -133,9 +137,16 @@ def train():
     test_loader  = DataLoader(STGCNDataset(X_test,  y_test),
                               batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    model = STGCN(num_classes=num_classes, dropout=DROPOUT).to(DEVICE)
+    model = STGCN(
+        num_classes = num_classes,
+        in_channels = 2,
+        num_joints  = num_joints,
+        dropout     = DROPOUT
+    ).to(DEVICE)
+
     total = sum(p.numel() for p in model.parameters())
     print(f"\n   Model    : ST-GCN")
+    print(f"   Joints   : {num_joints}")
     print(f"   Params   : {total:,}")
 
     criterion = nn.CrossEntropyLoss()
@@ -176,9 +187,9 @@ def train():
 
         with torch.no_grad():
             for X_b, y_b in val_loader:
-                X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
-                out       = model(X_b)
-                val_loss += criterion(out, y_b).item()
+                X_b, y_b  = X_b.to(DEVICE), y_b.to(DEVICE)
+                out        = model(X_b)
+                val_loss  += criterion(out, y_b).item()
                 val_correct += (out.argmax(1) == y_b).sum().item()
 
         val_acc  = val_correct / len(val_loader.dataset)
@@ -199,16 +210,15 @@ def train():
             f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.3f}{marker}"
         )
 
-    # ── Final test evaluation ──────────────────────────────────────────────
+    # ── Final test ────────────────────────────────────────────────────────
     print(f"\n── Final Test Set Evaluation ───────────────────────")
     model.load_state_dict(torch.load(MODEL_SAVE, map_location=DEVICE,
                                      weights_only=True))
     model.eval()
-
     test_correct = 0
     with torch.no_grad():
         for X_b, y_b in test_loader:
-            X_b, y_b    = X_b.to(DEVICE), y_b.to(DEVICE)
+            X_b, y_b     = X_b.to(DEVICE), y_b.to(DEVICE)
             test_correct += (model(X_b).argmax(1) == y_b).sum().item()
 
     test_acc = test_correct / len(test_loader.dataset)
