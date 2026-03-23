@@ -1,9 +1,10 @@
 """
-train.py — Training with original ST-GCN (two-stream)
-======================================================
-Uses the ported original ST-GCN code from Yan et al. AAAI 2018.
-Two streams: joint positions + motion (second-order difference).
-K-Fold cross validation with full augmentation.
+train.py — Three-stream ST-GCN training with K-Fold Cross Validation
+=====================================================================
+Uses original ST-GCN architecture (Yan et al. AAAI 2018) with 3 streams:
+  1. Joint positions
+  2. Motion (second-order difference) — original paper
+  3. Bone vectors (child - parent)
 """
 
 import os
@@ -17,7 +18,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from models.st_gcn_twostream import Model as TwoStreamSTGCN
+from models.st_gcn_twostream import Model as ThreeStreamSTGCN
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR    = os.path.join(ROOT, "output")
@@ -31,8 +32,6 @@ SEED          = 42
 K_FOLDS       = 5
 TEST_SPLIT    = 0.15
 
-# Graph args — uses our MediaPipe 51-joint layout with spatial strategy
-# (spatial strategy = original paper's best performing partition)
 GRAPH_ARGS = {
     'layout'  : 'mediapipe_51',
     'strategy': 'spatial',
@@ -50,50 +49,34 @@ def augment_skeleton(x):
     """Full augmentation for (T, F) skeleton."""
     T, F = x.shape
 
-    # Gaussian noise
     if np.random.rand() < 0.5:
         x = x + np.random.randn(*x.shape).astype(np.float32) * 0.01
-
-    # Random scale
     if np.random.rand() < 0.5:
         x = x * np.random.uniform(0.85, 1.15)
-
-    # Random rotation
     if np.random.rand() < 0.5:
-        angle    = np.random.uniform(-15, 15) * np.pi / 180
+        angle        = np.random.uniform(-15, 15) * np.pi / 180
         cos_a, sin_a = np.cos(angle), np.sin(angle)
-        x_rot    = x.copy()
+        x_rot        = x.copy()
         for i in range(0, F, 2):
             xv = x[:, i]; yv = x[:, i+1]
             x_rot[:, i]   = cos_a * xv - sin_a * yv
             x_rot[:, i+1] = sin_a * xv + cos_a * yv
         x = x_rot
-
-    # Horizontal flip
     if np.random.rand() < 0.5:
         x[:, 0::2] = -x[:, 0::2]
-
-    # Frame drop
     if np.random.rand() < 0.3:
         mask = np.random.rand(T) > 0.1
         kept = x[mask]
         if len(kept) >= 2:
-            idx = np.linspace(0, len(kept)-1, T).astype(int)
-            x   = kept[idx]
-
-    # Time warp
+            x = kept[np.linspace(0, len(kept)-1, T).astype(int)]
     if np.random.rand() < 0.3:
         warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
-        warp = (warp / warp[-1] * (T-1)).astype(int)
-        x    = x[np.clip(warp, 0, T-1)]
-
-    # Temporal crop
+        x    = x[np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)]
     if np.random.rand() < 0.3:
         crop_len = int(T * np.random.uniform(0.8, 1.0))
         start    = np.random.randint(0, T - crop_len + 1)
         cropped  = x[start:start+crop_len]
-        idx      = np.linspace(0, len(cropped)-1, T).astype(int)
-        x        = cropped[idx]
+        x        = cropped[np.linspace(0, len(cropped)-1, T).astype(int)]
 
     return x.astype(np.float32)
 
@@ -104,12 +87,14 @@ def augment_skeleton(x):
 
 class STGCNDataset(Dataset):
     """
-    Converts flat (T, F) keypoints → (C, T, V) graph format.
-    F = 102, C = 2, V = 51
+    Loads joint + bone streams.
+    Converts (T, F) → (C, T, V).
+    Motion is computed inside the model (original paper style).
     """
 
-    def __init__(self, X, y, augment=False):
-        self.X       = X.astype(np.float32)
+    def __init__(self, X_joint, X_bone, y, augment=False):
+        self.X_joint = X_joint.astype(np.float32)
+        self.X_bone  = X_bone.astype(np.float32)
         self.y       = y.astype(np.int64)
         self.augment = augment
 
@@ -120,18 +105,20 @@ class STGCNDataset(Dataset):
         """(T, F) → (C, T, V)"""
         T, F = x.shape
         V    = F // 2
-        # (T, F) → (T, V, 2) → (2, T, V)
-        return x.reshape(T, V, 2).transpose(2, 0, 1)
+        return x.reshape(T, V, 2).transpose(2, 0, 1)  # (2, T, V)
 
     def __getitem__(self, idx):
-        x = self.X[idx].copy()
+        xj = self.X_joint[idx].copy()
+        xb = self.X_bone[idx].copy()
 
         if self.augment:
-            x = augment_skeleton(x)
+            xj = augment_skeleton(xj)
+            xb = augment_skeleton(xb)
 
         return (
-            torch.tensor(self.to_graph(x), dtype=torch.float32),
-            torch.tensor(self.y[idx],      dtype=torch.long)
+            torch.tensor(self.to_graph(xj), dtype=torch.float32),
+            torch.tensor(self.to_graph(xb), dtype=torch.float32),
+            torch.tensor(self.y[idx],        dtype=torch.long)
         )
 
 
@@ -140,40 +127,53 @@ class STGCNDataset(Dataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_data():
+    # Joint stream
     for fname in ["X_final.npy", "X_normalized.npy", "X_raw.npy"]:
         path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(path):
             print(f"Loading {fname} ...")
-            X = np.load(path)
+            X_joint = np.load(path)
             break
     else:
-        raise FileNotFoundError(
-            "No data found. Run preprocessing scripts first."
-        )
+        raise FileNotFoundError("No joint data found.")
 
     y = np.load(os.path.join(OUTPUT_DIR, "y.npy"))
-    print(f"   X shape  : {X.shape}")
+
+    # Bone stream
+    bone_path = os.path.join(OUTPUT_DIR, "X_bones.npy")
+    if os.path.exists(bone_path):
+        print(f"Loading X_bones.npy ...")
+        X_bone = np.load(bone_path)
+    else:
+        print("⚠️  X_bones.npy not found — run normalize.py first")
+        print("   Using zeros for bone stream")
+        X_bone = np.zeros_like(X_joint)
+
+    print(f"   X shape  : {X_joint.shape}")
     print(f"   y shape  : {y.shape}")
-    print(f"   Joints   : {X.shape[2]//2}")
-    return X, y
+    print(f"   Joints   : {X_joint.shape[2]//2}")
+
+    return X_joint, X_bone, y
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TRAIN ONE FOLD
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_fold(X_tr, y_tr, X_val, y_val, num_classes, fold):
+def train_fold(X_j_tr, X_b_tr, y_tr,
+               X_j_val, X_b_val, y_val,
+               num_classes, fold):
 
     train_loader = DataLoader(
-        STGCNDataset(X_tr,  y_tr,  augment=True),
+        STGCNDataset(X_j_tr,  X_b_tr,  y_tr,  augment=True),
         batch_size=BATCH_SIZE, shuffle=True,  num_workers=0
     )
     val_loader = DataLoader(
-        STGCNDataset(X_val, y_val, augment=False),
+        STGCNDataset(X_j_val, X_b_val, y_val, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0
     )
 
-    model = TwoStreamSTGCN(
+    model = ThreeStreamSTGCN(
         in_channels              = 2,
         num_class                = num_classes,
         graph_args               = GRAPH_ARGS,
@@ -192,34 +192,37 @@ def train_fold(X_tr, y_tr, X_val, y_val, num_classes, fold):
     best_state   = None
 
     print(f"\n── Fold {fold} ─────────────────────────────────────────")
-    print(f"   Train: {len(X_tr)}  Val: {len(X_val)}")
+    print(f"   Train: {len(X_j_tr)}  Val: {len(X_j_val)}")
 
     for epoch in range(1, EPOCHS + 1):
-        # Train
+
+        # ── Train ─────────────────────────────────────────────────────────
         model.train()
         tr_loss = tr_correct = 0
-        for X_b, y_b in train_loader:
-            X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
+
+        for xj, xb, yb in train_loader:
+            xj, xb, yb = xj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE)
             optimizer.zero_grad()
-            out  = model(X_b)
-            loss = criterion(out, y_b)
+            out  = model(xj, bone=xb)
+            loss = criterion(out, yb)
             loss.backward()
             optimizer.step()
             tr_loss    += loss.item()
-            tr_correct += (out.argmax(1) == y_b).sum().item()
+            tr_correct += (out.argmax(1) == yb).sum().item()
 
         tr_acc  = tr_correct / len(train_loader.dataset)
         tr_loss /= len(train_loader)
 
-        # Validate
+        # ── Validate ──────────────────────────────────────────────────────
         model.eval()
         v_loss = v_correct = 0
+
         with torch.no_grad():
-            for X_b, y_b in val_loader:
-                X_b, y_b  = X_b.to(DEVICE), y_b.to(DEVICE)
-                out        = model(X_b)
-                v_loss    += criterion(out, y_b).item()
-                v_correct += (out.argmax(1) == y_b).sum().item()
+            for xj, xb, yb in val_loader:
+                xj, xb, yb = xj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE)
+                out         = model(xj, bone=xb)
+                v_loss     += criterion(out, yb).item()
+                v_correct  += (out.argmax(1) == yb).sum().item()
 
         v_acc  = v_correct / len(val_loader.dataset)
         v_loss /= len(val_loader)
@@ -248,47 +251,46 @@ def train_fold(X_tr, y_tr, X_val, y_val, num_classes, fold):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train():
-    X, y        = load_data()
-    num_classes = len(np.unique(y))
-    num_joints  = X.shape[2] // 2
+    X_joint, X_bone, y = load_data()
+    num_classes         = len(np.unique(y))
 
-    # Count params
-    _m     = TwoStreamSTGCN(2, num_classes, GRAPH_ARGS, True, dropout=DROPOUT)
-    total  = sum(p.numel() for p in _m.parameters())
+    _m    = ThreeStreamSTGCN(2, num_classes, GRAPH_ARGS, True, dropout=DROPOUT)
+    total = sum(p.numel() for p in _m.parameters())
     del _m
 
     print(f"   Classes  : {num_classes}")
-    print(f"   Joints   : {num_joints}")
-    print(f"   Model    : Two-Stream ST-GCN (Yan et al. 2018)")
+    print(f"   Model    : Three-Stream ST-GCN (Yan et al. 2018 + bone stream)")
+    print(f"   Streams  : joint + motion (2nd-order) + bone")
     print(f"   Strategy : {GRAPH_ARGS['strategy']} partition")
     print(f"   Params   : {total:,}")
 
     # Hold out test set
-    idx_all              = np.arange(len(y))
-    idx_tv, idx_test     = train_test_split(
+    idx_all          = np.arange(len(y))
+    idx_tv, idx_test = train_test_split(
         idx_all, test_size=TEST_SPLIT, random_state=SEED, stratify=y
     )
-    X_test, y_test       = X[idx_test], y[idx_test]
-    X_tv,   y_tv         = X[idx_tv],   y[idx_tv]
 
-    np.save(os.path.join(OUTPUT_DIR, "X_test.npy"), X_test)
+    X_j_test, X_b_test, y_test = X_joint[idx_test], X_bone[idx_test], y[idx_test]
+    X_j_tv,   X_b_tv,   y_tv   = X_joint[idx_tv],   X_bone[idx_tv],   y[idx_tv]
+
+    np.save(os.path.join(OUTPUT_DIR, "X_test.npy"), X_j_test)
     np.save(os.path.join(OUTPUT_DIR, "y_test.npy"), y_test)
 
     print(f"\n── K-Fold Cross Validation (k={K_FOLDS}) ───────────────────")
     print(f"   Train+Val: {len(y_tv)}  Test (held out): {len(y_test)}")
     print(f"{'='*60}")
-    print(f"  Two-Stream ST-GCN | Epochs: {EPOCHS} | Batch: {BATCH_SIZE}")
+    print(f"  Three-Stream ST-GCN | Epochs: {EPOCHS} | Batch: {BATCH_SIZE}")
     print(f"{'='*60}")
 
-    skf       = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
-    fold_accs = []
-    best_acc  = 0.0
-    best_state= None
+    skf        = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+    fold_accs  = []
+    best_acc   = 0.0
+    best_state = None
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_tv, y_tv), 1):
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_j_tv, y_tv), 1):
         val_acc, state = train_fold(
-            X_tv[tr_idx], y_tv[tr_idx],
-            X_tv[val_idx], y_tv[val_idx],
+            X_j_tv[tr_idx],  X_b_tv[tr_idx],  y_tv[tr_idx],
+            X_j_tv[val_idx], X_b_tv[val_idx],  y_tv[val_idx],
             num_classes, fold
         )
         fold_accs.append(val_acc)
@@ -304,8 +306,8 @@ def train():
     print(f"   Mean  : {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
 
-    # Final test with best model
-    model = TwoStreamSTGCN(
+    # Final test
+    model = ThreeStreamSTGCN(
         in_channels=2, num_class=num_classes,
         graph_args=GRAPH_ARGS, edge_importance_weighting=True,
         dropout=DROPOUT
@@ -314,16 +316,16 @@ def train():
     torch.save(best_state, MODEL_SAVE)
 
     test_loader = DataLoader(
-        STGCNDataset(X_test, y_test, augment=False),
+        STGCNDataset(X_j_test, X_b_test, y_test, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0
     )
 
     model.eval()
     test_correct = 0
     with torch.no_grad():
-        for X_b, y_b in test_loader:
-            X_b, y_b     = X_b.to(DEVICE), y_b.to(DEVICE)
-            test_correct += (model(X_b).argmax(1) == y_b).sum().item()
+        for xj, xb, yb in test_loader:
+            xj, xb, yb   = xj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE)
+            test_correct += (model(xj, bone=xb).argmax(1) == yb).sum().item()
 
     test_acc = test_correct / len(y_test)
 
