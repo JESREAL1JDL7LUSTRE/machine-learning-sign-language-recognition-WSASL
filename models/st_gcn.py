@@ -1,17 +1,13 @@
 """
 st_gcn.py
 =========
-Original ST-GCN architecture from:
-  Yan et al. "Spatial Temporal Graph Convolutional Networks for
-  Skeleton-Based Action Recognition", AAAI 2018.
-  https://github.com/yysijie/st-gcn
+Original ST-GCN (Yan et al. AAAI 2018) + improvements:
+  1. Adaptive graph topology (Zhang et al. STA-GCN 2020)
+  2. DropGraph regularization (Jiang et al. 2021)
+  3. Early fusion support via feature projection layer
 
-Ported to modern PyTorch (2.x):
-  - Removed torch.autograd.Variable (deprecated since PyTorch 0.4)
-  - Input shape changed from (N,C,T,V,M) to (N,C,T,V)
-    (M=1 person, squeezed for simplicity)
-  - Added 'mediapipe_51' graph layout
-  - edge_importance_weighting kept as original
+Input shape : (N, C, T, V)
+Output shape: (N, num_class) OR (N, feat_dim) when extract_features=True
 """
 
 import torch
@@ -19,46 +15,58 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.tgcn  import ConvTemporalGraphical
-from models.graph import Graph
+from models.graph import Graph, AdaptiveAdjacency, drop_graph
 
 
 class Model(nn.Module):
-    """Spatial Temporal Graph Convolutional Network.
+    """ST-GCN with adaptive topology and DropGraph.
 
     Args:
-        in_channels (int): Number of input channels (2 for x,y)
-        num_class (int): Number of action/sign classes
-        graph_args (dict): Arguments for Graph() — layout and strategy
-        edge_importance_weighting (bool): Learn per-edge importance weights
-        **kwargs: dropout, etc.
-
-    Input shape : (N, in_channels, T, V)
-    Output shape: (N, num_class)
+        in_channels (int): input channels (2 for x,y)
+        num_class (int): number of classes
+        graph_args (dict): layout and strategy for Graph()
+        edge_importance_weighting (bool): learnable per-layer edge weights
+        adaptive_graph (bool): add learnable adjacency on top of fixed graph
+        drop_graph_prob (float): DropGraph probability (0 = disabled)
+        extract_features (bool): if True return 256-d features not logits
+        **kwargs: dropout etc.
     """
 
-    def __init__(self,
-                 in_channels,
-                 num_class,
-                 graph_args,
+    def __init__(self, in_channels, num_class, graph_args,
                  edge_importance_weighting=True,
+                 adaptive_graph=True,
+                 drop_graph_prob=0.1,
+                 extract_features=False,
                  **kwargs):
         super().__init__()
+
+        self.drop_graph_prob  = drop_graph_prob
+        self.extract_features = extract_features
 
         # ── Build graph ───────────────────────────────────────────────────────
         self.graph = Graph(**graph_args)
         A = torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False)
         self.register_buffer('A', A)
 
-        # ── Network config ────────────────────────────────────────────────────
         spatial_kernel_size  = A.size(0)
         temporal_kernel_size = 9
         kernel_size          = (temporal_kernel_size, spatial_kernel_size)
 
         self.data_bn = nn.BatchNorm1d(in_channels * A.size(1))
 
+        # ── Adaptive graph ────────────────────────────────────────────────────
+        if adaptive_graph:
+            self.adaptive_adj = AdaptiveAdjacency(
+                num_joints  = A.size(1),
+                num_subsets = A.size(0),
+                alpha       = 0.1
+            )
+        else:
+            self.adaptive_adj = None
+
         kwargs0 = {k: v for k, v in kwargs.items() if k != 'dropout'}
 
-        # Original 10-layer ST-GCN architecture (Yan et al. 2018)
+        # ── Original 10-layer architecture ────────────────────────────────────
         self.st_gcn_networks = nn.ModuleList([
             st_gcn(in_channels, 64,  kernel_size, 1, residual=False, **kwargs0),
             st_gcn(64,          64,  kernel_size, 1, **kwargs),
@@ -72,7 +80,6 @@ class Model(nn.Module):
             st_gcn(256,         256, kernel_size, 1, **kwargs),
         ])
 
-        # ── Edge importance weighting (learnable) ────────────────────────────
         if edge_importance_weighting:
             self.edge_importance = nn.ParameterList([
                 nn.Parameter(torch.ones(self.A.size()))
@@ -81,73 +88,57 @@ class Model(nn.Module):
         else:
             self.edge_importance = [1] * len(self.st_gcn_networks)
 
-        # ── Classifier ───────────────────────────────────────────────────────
         self.fcn = nn.Conv2d(256, num_class, kernel_size=1)
 
     def forward(self, x):
-        # x: (N, C, T, V)
         N, C, T, V = x.size()
 
-        # Data normalization
-        x = x.permute(0, 3, 1, 2).contiguous()   # (N, V, C, T)
-        x = x.view(N, V * C, T)
+        # ── Data normalization ────────────────────────────────────────────────
+        x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
         x = self.data_bn(x)
-        x = x.view(N, V, C, T)
-        x = x.permute(0, 2, 3, 1).contiguous()   # (N, C, T, V)
+        x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
 
-        # ST-GCN forward
+        # ── Apply DropGraph ───────────────────────────────────────────────────
+        x = drop_graph(x, self.drop_graph_prob, self.training)
+
+        # ── Get adjacency (fixed + adaptive) ─────────────────────────────────
+        if self.adaptive_adj is not None:
+            A = self.adaptive_adj(self.A)
+        else:
+            A = self.A
+
+        # ── ST-GCN forward ────────────────────────────────────────────────────
         for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
-            x, _ = gcn(x, self.A * importance)
+            x, _ = gcn(x, A * importance)
 
-        # Global average pooling
-        x = F.avg_pool2d(x, x.size()[2:])         # (N, 256, 1, 1)
-        x = x.view(N, -1, 1, 1)
+        # ── Global average pool ───────────────────────────────────────────────
+        x = F.avg_pool2d(x, x.size()[2:])   # (N, 256, 1, 1)
 
-        # Prediction
+        if self.extract_features:
+            return x.view(N, -1)             # (N, 256) for early fusion
+
         x = self.fcn(x)
-        x = x.view(N, -1)
-
-        return x
+        return x.view(N, -1)                 # (N, num_class)
 
 
 class st_gcn(nn.Module):
-    """One ST-GCN block: graph conv + temporal conv + residual.
+    """One ST-GCN block."""
 
-    Args:
-        in_channels (int)
-        out_channels (int)
-        kernel_size (tuple): (temporal_ks, spatial_ks)
-        stride (int): temporal stride
-        dropout (float): dropout rate
-        residual (bool): use residual connection
-    """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride=1,
-                 dropout=0,
-                 residual=True):
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, dropout=0, residual=True):
         super().__init__()
 
         assert len(kernel_size) == 2
         assert kernel_size[0] % 2 == 1
         padding = ((kernel_size[0] - 1) // 2, 0)
 
-        self.gcn = ConvTemporalGraphical(in_channels, out_channels,
-                                         kernel_size[1])
+        self.gcn = ConvTemporalGraphical(in_channels, out_channels, kernel_size[1])
 
         self.tcn = nn.Sequential(
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                (kernel_size[0], 1),
-                (stride, 1),
-                padding,
-            ),
+            nn.Conv2d(out_channels, out_channels, (kernel_size[0], 1),
+                      (stride, 1), padding),
             nn.BatchNorm2d(out_channels),
             nn.Dropout(dropout, inplace=True),
         )
@@ -166,7 +157,7 @@ class st_gcn(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, A):
-        res = self.residual(x)
+        res  = self.residual(x)
         x, A = self.gcn(x, A)
-        x = self.tcn(x) + res
+        x    = self.tcn(x) + res
         return self.relu(x), A

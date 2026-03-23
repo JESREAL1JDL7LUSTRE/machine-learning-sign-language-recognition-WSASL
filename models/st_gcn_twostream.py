@@ -1,17 +1,22 @@
 """
 st_gcn_twostream.py
 ===================
-Three-stream ST-GCN extending Yan et al. AAAI 2018.
+Four-stream ST-GCN with early fusion.
 
 Streams:
-  1. Origin  : raw joint positions
-  2. Motion  : second-order temporal difference (original paper formula)
-  3. Bone    : bone vectors (child - parent joint)
+  1. Joint positions
+  2. Motion (second-order diff — original paper formula)
+  3. Bone vectors
+  4. Bone motion (Δbone over time)
 
-Final score = origin_stream(x) + motion_stream(m) + bone_stream(b)
+Fusion strategy (based on paper findings):
+  - Late fusion  : sum of final logits (original approach)
+  - Early fusion : concatenate 256-d features BEFORE classifier,
+                   then a shared FC maps to num_class.
+                   This allows streams to interact — addresses the
+                   "late fusion bottleneck" identified in the paper.
 
-Input shape : (N, C, T, V)
-Output shape: (N, num_class)
+Based on: Yan et al. AAAI 2018 + Jiang et al. 2021 + Zhang et al. 2020
 """
 
 import torch
@@ -21,44 +26,86 @@ from models.st_gcn import Model as ST_GCN
 
 
 class Model(nn.Module):
-    """Three-stream ST-GCN.
+    """Four-stream ST-GCN with early fusion.
 
-    Stream 1 (origin): raw joint positions
-    Stream 2 (motion): second-order temporal difference
-        m[t] = x[t] - 0.5*x[t+1] - 0.5*x[t-1]
-    Stream 3 (bone)  : bone vectors passed in directly
-
-    Final score = sum of all three stream logits
+    Input  : joint (N,C,T,V), bone (N,C,T,V), motion computed internally,
+             bone_motion (N,C,T,V)
+    Output : (N, num_class)
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, early_fusion=True, **kwargs):
         super().__init__()
-        self.origin_stream = ST_GCN(*args, **kwargs)
-        self.motion_stream = ST_GCN(*args, **kwargs)
-        self.bone_stream   = ST_GCN(*args, **kwargs)
 
-    def forward(self, x, bone=None):
-        """
-        Args:
-            x    : joint positions (N, C, T, V)
-            bone : bone vectors    (N, C, T, V) — if None, zeros used
-        """
+        self.early_fusion = early_fusion
+
+        if early_fusion:
+            # Each stream extracts 256-d features (no classifier head)
+            kwargs_feat = {**kwargs, 'extract_features': True}
+            self.joint_stream      = ST_GCN(*args, **kwargs_feat)
+            self.motion_stream     = ST_GCN(*args, **kwargs_feat)
+            self.bone_stream       = ST_GCN(*args, **kwargs_feat)
+            self.bone_motion_stream= ST_GCN(*args, **kwargs_feat)
+
+            # Early fusion classifier: 4 streams × 256 → num_class
+            num_class = args[1]   # second positional arg
+            self.fusion_fc = nn.Sequential(
+                nn.Linear(256 * 4, 512),
+                nn.BatchNorm1d(512),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.4),
+                nn.Linear(512, num_class)
+            )
+        else:
+            # Late fusion: each stream outputs logits, sum at end
+            self.joint_stream      = ST_GCN(*args, **kwargs)
+            self.motion_stream     = ST_GCN(*args, **kwargs)
+            self.bone_stream       = ST_GCN(*args, **kwargs)
+            self.bone_motion_stream= ST_GCN(*args, **kwargs)
+
+    def _compute_motion(self, x):
+        """Second-order motion (original paper formula)."""
         N, C, T, V = x.size()
-
-        # ── Stream 2: second-order motion (original paper formula) ────────────
         zeros = torch.zeros(N, C, 1, V, device=x.device, dtype=x.dtype)
-        m = torch.cat([
+        return torch.cat([
             zeros,
             x[:, :, 1:-1] - 0.5 * x[:, :, 2:] - 0.5 * x[:, :, :-2],
             zeros
         ], dim=2)
 
-        # ── Stream 3: bone vectors ────────────────────────────────────────────
+    def forward(self, x, bone=None, bone_motion=None):
+        """
+        Args:
+            x           : joint positions   (N, C, T, V)
+            bone        : bone vectors       (N, C, T, V)
+            bone_motion : bone motion stream (N, C, T, V)
+        """
+        # Compute second-order motion internally (original paper style)
+        motion = self._compute_motion(x)
+
+        # Fallback zeros if streams not provided
         if bone is None:
             bone = torch.zeros_like(x)
+        if bone_motion is None:
+            bone_motion = torch.zeros_like(x)
 
-        return (
-            self.origin_stream(x) +
-            self.motion_stream(m) +
-            self.bone_stream(bone)
-        )
+        if self.early_fusion:
+            # Each stream → 256-d feature vector
+            f_joint       = self.joint_stream(x)
+            f_motion      = self.motion_stream(motion)
+            f_bone        = self.bone_stream(bone)
+            f_bone_motion = self.bone_motion_stream(bone_motion)
+
+            # Concatenate all features (N, 1024)
+            fused = torch.cat([f_joint, f_motion, f_bone, f_bone_motion], dim=1)
+
+            # Shared classifier (allows cross-stream interaction)
+            return self.fusion_fc(fused)
+
+        else:
+            # Late fusion: sum of logits
+            return (
+                self.joint_stream(x) +
+                self.motion_stream(motion) +
+                self.bone_stream(bone) +
+                self.bone_motion_stream(bone_motion)
+            )
