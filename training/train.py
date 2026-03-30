@@ -1,13 +1,16 @@
 """
 train.py
 ========
-Four-stream ST-GCN training with:
+Four-stream ST-GCN with all improvements:
   - Joint + Motion + Bone + Bone Motion streams
-  - Early fusion (cross-stream interaction before classifier)
-  - Adaptive graph topology (learnable edges)
-  - DropGraph regularization
-  - K-Fold cross validation (k=5)
-  - Full augmentation pipeline
+  - Early fusion
+  - Adaptive graph + DropGraph
+  - K-Fold CV (k=5)
+  - Full augmentation
+  - Weighted CrossEntropy (class imbalance fix)
+  - Label smoothing (prevents overconfidence)
+  - AdamW optimizer
+  - Reduced batch size for small data
 """
 
 import os
@@ -15,6 +18,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
@@ -27,10 +31,10 @@ from models.st_gcn_twostream import Model as FourStreamSTGCN
 OUTPUT_DIR    = os.path.join(ROOT, "output")
 MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn.pth")
 
-BATCH_SIZE    = 16
+BATCH_SIZE    = 8       # smaller — better gradient estimates on tiny data
 EPOCHS        = 100
-LEARNING_RATE = 0.001
-DROPOUT       = 0.4
+LEARNING_RATE = 0.0005  # lower — AdamW works better with smaller LR
+DROPOUT       = 0.5     # higher — more regularization for small data
 SEED          = 42
 K_FOLDS       = 5
 TEST_SPLIT    = 0.15
@@ -40,13 +44,60 @@ GRAPH_ARGS = {
     'strategy': 'spatial',
 }
 
-# Model flags
-ADAPTIVE_GRAPH  = True    # learnable adjacency on top of fixed graph
-DROP_GRAPH_PROB = 0.1     # DropGraph probability
-EARLY_FUSION    = True    # concatenate features before classifier
+ADAPTIVE_GRAPH    = True
+DROP_GRAPH_PROB   = 0.15
+EARLY_FUSION      = True
+LABEL_SMOOTHING   = 0.1
+USE_WEIGHTED_LOSS = True
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LABEL SMOOTHING LOSS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LabelSmoothingLoss(nn.Module):
+    """
+    CrossEntropy with label smoothing + optional class weights.
+
+    Smoothing = 0.1 means:
+      correct class gets 0.9 instead of 1.0
+      all other classes get 0.1/(C-1) instead of 0.0
+    Prevents overconfident predictions on tiny datasets.
+    """
+
+    def __init__(self, num_classes, smoothing=0.1, weight=None):
+        super().__init__()
+        self.smoothing   = smoothing
+        self.num_classes = num_classes
+        self.weight      = weight
+
+    def forward(self, pred, target):
+        log_prob = F.log_softmax(pred, dim=1)
+
+        with torch.no_grad():
+            smooth = torch.zeros_like(log_prob)
+            smooth.fill_(self.smoothing / (self.num_classes - 1))
+            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+
+        if self.weight is not None:
+            w    = self.weight[target].unsqueeze(1)
+            loss = -(smooth * log_prob * w).sum(dim=1).mean()
+        else:
+            loss = -(smooth * log_prob).sum(dim=1).mean()
+
+        return loss
+
+
+def compute_class_weights(y, num_classes, device):
+    """Inverse frequency weights — rare classes get higher weight."""
+    counts  = np.bincount(y, minlength=num_classes).astype(np.float32)
+    counts  = np.where(counts == 0, 1, counts)
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * num_classes
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,12 +142,6 @@ def augment_skeleton(x):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FourStreamDataset(Dataset):
-    """
-    Loads all 4 streams: joint, bone, motion (not stored — computed in model),
-    bone_motion.
-    Converts (T, F) → (C, T, V) for each stream.
-    """
-
     def __init__(self, X_joint, X_bone, X_bone_motion, y, augment=False):
         self.X_joint       = X_joint.astype(np.float32)
         self.X_bone        = X_bone.astype(np.float32)
@@ -108,7 +153,6 @@ class FourStreamDataset(Dataset):
         return len(self.y)
 
     def to_graph(self, x):
-        """(T, F) → (C, T, V)"""
         T, F = x.shape
         V    = F // 2
         return x.reshape(T, V, 2).transpose(2, 0, 1)
@@ -147,23 +191,24 @@ def load_data():
 
     y = np.load(os.path.join(OUTPUT_DIR, "y.npy"))
 
-    def load_stream(fname, fallback_fn, name):
+    def load_stream(fname, name):
         path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(path):
             print(f"  {name:<14}: {fname}")
             return np.load(path)
-        print(f"  ⚠️  {fname} not found — run normalize.py")
-        return fallback_fn(X_joint)
+        print(f"  ⚠️  {fname} not found — using zeros")
+        return np.zeros_like(X_joint)
 
-    X_bone        = load_stream("X_bones.npy",
-                                lambda x: np.zeros_like(x), "Bone stream")
-    X_bone_motion = load_stream("X_bone_motion.npy",
-                                lambda x: np.zeros_like(x), "Bone motion")
+    X_bone        = load_stream("X_bones.npy",       "Bone stream")
+    X_bone_motion = load_stream("X_bone_motion.npy", "Bone motion")
 
     print(f"\n  X shape  : {X_joint.shape}")
     print(f"  y shape  : {y.shape}")
     print(f"  Joints   : {X_joint.shape[2]//2}")
-    print(f"  Streams  : joint + motion(internal) + bone + bone_motion = 4")
+
+    # Show class distribution
+    unique, counts = np.unique(y, return_counts=True)
+    print(f"  Classes  : {len(unique)} | min samples: {counts.min()} | max: {counts.max()} | mean: {counts.mean():.1f}")
 
     return X_joint, X_bone, X_bone_motion, y
 
@@ -194,9 +239,26 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
         dropout                   = DROPOUT
     ).to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE,
-                                 weight_decay=1e-3)
+    # ── Class weights for imbalance ───────────────────────────────────────────
+    if USE_WEIGHTED_LOSS:
+        class_weights = compute_class_weights(y_tr, num_classes, DEVICE)
+    else:
+        class_weights = None
+
+    # ── Label smoothing loss ──────────────────────────────────────────────────
+    criterion = LabelSmoothingLoss(
+        num_classes = num_classes,
+        smoothing   = LABEL_SMOOTHING,
+        weight      = class_weights
+    )
+
+    # ── AdamW optimizer (better weight decay than Adam) ───────────────────────
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr           = LEARNING_RATE,
+        weight_decay = 1e-2   # stronger weight decay with AdamW
+    )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=EPOCHS
     )
@@ -218,6 +280,10 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
             out  = model(xj, bone=xb, bone_motion=xbm)
             loss = criterion(out, yb)
             loss.backward()
+
+            # Gradient clipping — prevents exploding gradients on small batches
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             tr_loss    += loss.item()
             tr_correct += (out.argmax(1) == yb).sum().item()
@@ -281,9 +347,12 @@ def train():
     print(f"\n  Classes       : {num_classes}")
     print(f"  Model         : Four-Stream ST-GCN")
     print(f"  Streams       : joint + motion + bone + bone_motion")
-    print(f"  Fusion        : {'Early (concat+FC)' if EARLY_FUSION else 'Late (sum logits)'}")
+    print(f"  Fusion        : {'Early (concat+FC)' if EARLY_FUSION else 'Late (sum)'}")
     print(f"  Adaptive graph: {ADAPTIVE_GRAPH}")
     print(f"  DropGraph     : {DROP_GRAPH_PROB}")
+    print(f"  Label smooth  : {LABEL_SMOOTHING}")
+    print(f"  Weighted loss : {USE_WEIGHTED_LOSS}")
+    print(f"  Optimizer     : AdamW (lr={LEARNING_RATE}, wd=1e-2)")
     print(f"  Params        : {total:,}")
 
     idx_all          = np.arange(len(y))
@@ -291,15 +360,10 @@ def train():
         idx_all, test_size=TEST_SPLIT, random_state=SEED, stratify=y
     )
 
-    Xj_test  = X_joint[idx_test]
-    Xb_test  = X_bone[idx_test]
-    Xbm_test = X_bone_motion[idx_test]
-    y_test   = y[idx_test]
-
-    Xj_tv  = X_joint[idx_tv]
-    Xb_tv  = X_bone[idx_tv]
-    Xbm_tv = X_bone_motion[idx_tv]
-    y_tv   = y[idx_tv]
+    Xj_test  = X_joint[idx_test];      Xb_test  = X_bone[idx_test]
+    Xbm_test = X_bone_motion[idx_test]; y_test   = y[idx_test]
+    Xj_tv    = X_joint[idx_tv];        Xb_tv    = X_bone[idx_tv]
+    Xbm_tv   = X_bone_motion[idx_tv];  y_tv     = y[idx_tv]
 
     np.save(os.path.join(OUTPUT_DIR, "X_test.npy"), Xj_test)
     np.save(os.path.join(OUTPUT_DIR, "y_test.npy"), y_test)
@@ -334,7 +398,7 @@ def train():
     print(f"   Mean  : {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
 
-    # ── Final test ────────────────────────────────────────────────────────────
+    # Final test
     model = FourStreamSTGCN(
         2, num_classes, GRAPH_ARGS,
         edge_importance_weighting=True,
