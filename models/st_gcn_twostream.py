@@ -50,7 +50,7 @@ class Model(nn.Module):
             num_class = args[1]   # second positional arg
             self.fusion_fc = nn.Sequential(
                 nn.Linear(256 * 4, 512),
-                nn.BatchNorm1d(512),
+                nn.LayerNorm(512),   # LayerNorm not BatchNorm — safe on batch size 1
                 nn.ReLU(inplace=True),
                 nn.Dropout(0.4),
                 nn.Linear(512, num_class)
