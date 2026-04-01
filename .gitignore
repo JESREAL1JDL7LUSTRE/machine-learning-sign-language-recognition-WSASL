@@ -1,3 +1,6 @@
 venv
 dataset
 .venv
+models\sign_stgcn.pth
+models\sign_lstm.pth
+output\*.npy

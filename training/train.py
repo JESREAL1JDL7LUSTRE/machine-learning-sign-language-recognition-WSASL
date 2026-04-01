@@ -1,15 +1,16 @@
 """
-train.py — Optimized for 50-class WLASL
-=========================================
-Key fixes vs previous run:
-  - K=4 folds (some classes have only 5 samples, K=5 would crash)
-  - Early stopping with patience=35 (val acc is noisy on 50 classes)
-  - Warmup (10 ep) + CosineAnnealing — gentler start
-  - drop_last=True on train loader — prevents BatchNorm crash on last batch
-  - weight_decay=5e-2 — strong regularization for 13M params / 508 samples
-  - DROPOUT=0.4, DROP_GRAPH=0.1 — less aggressive than 20-class (need capacity)
-  - LABEL_SMOOTHING=0.1 — less smoothing (50 classes is already hard)
-  - EPOCHS=300 with early stopping — previous run stopped at ep 50-80 still climbing
+train.py
+========
+Four-stream ST-GCN with all improvements:
+  - Joint + Motion + Bone + Bone Motion streams
+  - Early fusion
+  - Adaptive graph + DropGraph
+  - K-Fold CV (k=5)
+  - Full augmentation
+  - Weighted CrossEntropy (class imbalance fix)
+  - Label smoothing (prevents overconfidence)
+  - AdamW optimizer
+  - Reduced batch size for small data
 """
 
 import os
@@ -31,15 +32,15 @@ OUTPUT_DIR    = os.path.join(ROOT, "output")
 MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn.pth")
 
 BATCH_SIZE    = 4       # small — noisier gradients = implicit regularization
-EPOCHS        = 300     # more room — previous run stopped at ep 50-80 still climbing
+EPOCHS        = 300     # with early stopping — gives room to converge
 LEARNING_RATE = 0.0005
-DROPOUT       = 0.4     # reduced vs 20-class — 50 classes needs more capacity
+DROPOUT       = 0.4     # reduced — smaller model needs less dropout
 SEED          = 42
 K_FOLDS       = 4       # must be 4 — some classes have only 5 samples
 TEST_SPLIT    = 0.15
 
 # Early stopping
-PATIENCE      = 35      # val acc oscillates on 50 classes — give it room to recover
+PATIENCE      = 35      # val acc oscillates on 50 classes — give it room
 
 GRAPH_ARGS = {
     'layout'  : 'mediapipe_51',
@@ -47,9 +48,9 @@ GRAPH_ARGS = {
 }
 
 ADAPTIVE_GRAPH    = True
-DROP_GRAPH_PROB   = 0.1   # reduced — less aggressive than 20-class run
+DROP_GRAPH_PROB   = 0.1   # reduced — smaller model needs less DropGraph
 EARLY_FUSION      = True
-LABEL_SMOOTHING   = 0.1   # less smoothing — 50 classes is already hard enough
+LABEL_SMOOTHING   = 0.1
 USE_WEIGHTED_LOSS = True
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -61,6 +62,15 @@ print(f"Using device: {DEVICE}")
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LabelSmoothingLoss(nn.Module):
+    """
+    CrossEntropy with label smoothing + optional class weights.
+
+    Smoothing = 0.1 means:
+      correct class gets 0.9 instead of 1.0
+      all other classes get 0.1/(C-1) instead of 0.0
+    Prevents overconfident predictions on tiny datasets.
+    """
+
     def __init__(self, num_classes, smoothing=0.1, weight=None):
         super().__init__()
         self.smoothing   = smoothing
@@ -69,19 +79,23 @@ class LabelSmoothingLoss(nn.Module):
 
     def forward(self, pred, target):
         log_prob = F.log_softmax(pred, dim=1)
+
         with torch.no_grad():
             smooth = torch.zeros_like(log_prob)
             smooth.fill_(self.smoothing / (self.num_classes - 1))
             smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+
         if self.weight is not None:
             w    = self.weight[target].unsqueeze(1)
             loss = -(smooth * log_prob * w).sum(dim=1).mean()
         else:
             loss = -(smooth * log_prob).sum(dim=1).mean()
+
         return loss
 
 
 def compute_class_weights(y, num_classes, device):
+    """Inverse frequency weights — rare classes get higher weight."""
     counts  = np.bincount(y, minlength=num_classes).astype(np.float32)
     counts  = np.where(counts == 0, 1, counts)
     weights = 1.0 / counts
@@ -95,12 +109,12 @@ def compute_class_weights(y, num_classes, device):
 
 def augment_skeleton(x):
     T, F = x.shape
-    if np.random.rand() < 0.6:
-        x = x + np.random.randn(*x.shape).astype(np.float32) * 0.015
     if np.random.rand() < 0.5:
-        x = x * np.random.uniform(0.8, 1.2)
+        x = x + np.random.randn(*x.shape).astype(np.float32) * 0.01
     if np.random.rand() < 0.5:
-        angle        = np.random.uniform(-20, 20) * np.pi / 180
+        x = x * np.random.uniform(0.85, 1.15)
+    if np.random.rand() < 0.5:
+        angle        = np.random.uniform(-15, 15) * np.pi / 180
         cos_a, sin_a = np.cos(angle), np.sin(angle)
         x_rot        = x.copy()
         for i in range(0, F, 2):
@@ -110,16 +124,16 @@ def augment_skeleton(x):
         x = x_rot
     if np.random.rand() < 0.5:
         x[:, 0::2] = -x[:, 0::2]
-    if np.random.rand() < 0.4:
-        mask = np.random.rand(T) > 0.15
+    if np.random.rand() < 0.3:
+        mask = np.random.rand(T) > 0.1
         kept = x[mask]
         if len(kept) >= 2:
             x = kept[np.linspace(0, len(kept)-1, T).astype(int)]
-    if np.random.rand() < 0.4:
+    if np.random.rand() < 0.3:
         warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
         x    = x[np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)]
-    if np.random.rand() < 0.4:
-        crop_len = int(T * np.random.uniform(0.75, 1.0))
+    if np.random.rand() < 0.3:
+        crop_len = int(T * np.random.uniform(0.8, 1.0))
         start    = np.random.randint(0, T - crop_len + 1)
         cropped  = x[start:start+crop_len]
         x        = cropped[np.linspace(0, len(cropped)-1, T).astype(int)]
@@ -176,7 +190,7 @@ def load_data():
             X_joint = np.load(path)
             break
     else:
-        raise FileNotFoundError("No joint data found.")
+        raise FileNotFoundError("No joint data found. Run preprocessing first.")
 
     y = np.load(os.path.join(OUTPUT_DIR, "y.npy"))
 
@@ -191,11 +205,42 @@ def load_data():
     X_bone        = load_stream("X_bones.npy",       "Bone stream")
     X_bone_motion = load_stream("X_bone_motion.npy", "Bone motion")
 
-    unique, counts = np.unique(y, return_counts=True)
     print(f"\n  X shape  : {X_joint.shape}")
-    print(f"  Classes  : {len(unique)} | min: {counts.min()} | max: {counts.max()} | mean: {counts.mean():.1f}")
+    print(f"  y shape  : {y.shape}")
+    print(f"  Joints   : {X_joint.shape[2]//2}")
+
+    # Show class distribution
+    unique, counts = np.unique(y, return_counts=True)
+    print(f"  Classes  : {len(unique)} | min samples: {counts.min()} | max: {counts.max()} | mean: {counts.mean():.1f}")
 
     return X_joint, X_bone, X_bone_motion, y
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL FEATURE NORMALIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def global_normalize(X_tr, *X_others):
+    """
+    Standardize features using training set statistics only.
+
+    Computes mean and std from training data, then applies the same
+    transform to val/test. Prevents data leakage and gives the model
+    consistent scale statistics across all folds.
+
+    Args:
+        X_tr     : (N_tr, T, F) training array — stats computed from this
+        *X_others: any number of (N, T, F) arrays to normalize with same stats
+
+    Returns:
+        Tuple of normalized arrays in the same order as inputs.
+    """
+    mean = X_tr.mean(axis=(0, 1), keepdims=True)   # (1, 1, F)
+    std  = X_tr.std(axis=(0, 1), keepdims=True)    # (1, 1, F)
+    std  = np.where(std < 1e-6, 1.0, std)          # avoid divide-by-zero on static joints
+    X_tr_norm = (X_tr - mean) / std
+    others    = tuple((X - mean) / std for X in X_others)
+    return (X_tr_norm,) + others
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,7 +281,7 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = LEARNING_RATE,
-        weight_decay = 5e-2   # strong weight decay for 13M params / ~320 samples
+        weight_decay = 5e-2   # strong — 13M params on ~300 samples needs it
     )
 
     # Warmup 10 epochs then cosine decay — gentler start prevents early divergence
@@ -283,9 +328,9 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
             for xj, xb, xbm, yb in val_loader:
                 xj, xb, xbm, yb = (xj.to(DEVICE), xb.to(DEVICE),
                                     xbm.to(DEVICE), yb.to(DEVICE))
-                out         = model(xj, bone=xb, bone_motion=xbm)
-                v_loss     += criterion(out, yb).item()
-                v_correct  += (out.argmax(1) == yb).sum().item()
+                out        = model(xj, bone=xb, bone_motion=xbm)
+                v_loss    += criterion(out, yb).item()
+                v_correct += (out.argmax(1) == yb).sum().item()
 
         v_acc  = v_correct / len(val_loader.dataset)
         v_loss /= len(val_loader)
@@ -294,7 +339,7 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
         if v_acc > best_val_acc:
             best_val_acc = v_acc
             best_state   = {k: v.cpu().clone()
-                           for k, v in model.state_dict().items()}
+                            for k, v in model.state_dict().items()}
             patience_ctr = 0
             marker = "  ← best"
         else:
@@ -312,7 +357,8 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
 
         if patience_ctr >= PATIENCE:
             stopped_epoch = epoch
-            print(f"  ⏹  Early stopping at epoch {epoch} — no val improvement for {PATIENCE} epochs")
+            print(f"  ⏹  Early stopping at epoch {epoch} — "
+                  f"no val improvement for {PATIENCE} epochs")
             break
 
     print(f"  Best val acc: {best_val_acc:.3f} (stopped at epoch {stopped_epoch})")
@@ -340,13 +386,15 @@ def train():
     del _m
 
     print(f"\n  Classes       : {num_classes}")
-    print(f"  Params        : {total:,}")
-    print(f"  Batch size    : {BATCH_SIZE}")
-    print(f"  Max epochs    : {EPOCHS} (early stop patience={PATIENCE})")
-    print(f"  Dropout       : {DROPOUT}")
+    print(f"  Model         : Four-Stream ST-GCN")
+    print(f"  Streams       : joint + motion + bone + bone_motion")
+    print(f"  Fusion        : {'Early (concat+FC)' if EARLY_FUSION else 'Late (sum)'}")
+    print(f"  Adaptive graph: {ADAPTIVE_GRAPH}")
     print(f"  DropGraph     : {DROP_GRAPH_PROB}")
     print(f"  Label smooth  : {LABEL_SMOOTHING}")
-    print(f"  Weight decay  : 5e-2 (AdamW)")
+    print(f"  Weighted loss : {USE_WEIGHTED_LOSS}")
+    print(f"  Optimizer     : AdamW (lr={LEARNING_RATE}, wd=1e-2)")
+    print(f"  Params        : {total:,}")
 
     idx_all          = np.arange(len(y))
     idx_tv, idx_test = train_test_split(
@@ -364,6 +412,8 @@ def train():
     print(f"\n── K-Fold Cross Validation (k={K_FOLDS}) ───────────────────")
     print(f"   Train+Val: {len(y_tv)}  Test (held out): {len(y_test)}")
     print(f"{'='*60}")
+    print(f"  Four-Stream ST-GCN | Epochs: {EPOCHS} | Batch: {BATCH_SIZE}")
+    print(f"{'='*60}")
 
     skf        = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
     fold_accs  = []
@@ -371,15 +421,28 @@ def train():
     best_state = None
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(Xj_tv, y_tv), 1):
+        # ── Per-fold global normalization (train stats only) ──────────────────
+        # Normalizes each stream independently using training fold mean/std.
+        # Val and test are scaled with the same training statistics.
+        Xj_tr_n,  Xj_val_n,  Xj_test_n  = global_normalize(Xj_tv[tr_idx],  Xj_tv[val_idx],  Xj_test)
+        Xb_tr_n,  Xb_val_n,  Xb_test_n  = global_normalize(Xb_tv[tr_idx],  Xb_tv[val_idx],  Xb_test)
+        Xbm_tr_n, Xbm_val_n, Xbm_test_n = global_normalize(Xbm_tv[tr_idx], Xbm_tv[val_idx], Xbm_test)
+
         val_acc, state = train_fold(
-            Xj_tv[tr_idx],  Xb_tv[tr_idx],  Xbm_tv[tr_idx],  y_tv[tr_idx],
-            Xj_tv[val_idx], Xb_tv[val_idx],  Xbm_tv[val_idx], y_tv[val_idx],
+            Xj_tr_n,  Xb_tr_n,  Xbm_tr_n,  y_tv[tr_idx],
+            Xj_val_n, Xb_val_n, Xbm_val_n, y_tv[val_idx],
             num_classes, fold
         )
         fold_accs.append(val_acc)
+        print(f"  Fold {fold} best val acc: {val_acc:.3f}")
+
         if val_acc > best_acc:
-            best_acc   = val_acc
-            best_state = state
+            best_acc      = val_acc
+            best_state    = state
+            # Save the test data normalized with this fold's training stats
+            best_Xj_test  = Xj_test_n
+            best_Xb_test  = Xb_test_n
+            best_Xbm_test = Xbm_test_n
 
     print(f"\n── K-Fold Results ──────────────────────────────────")
     for i, acc in enumerate(fold_accs, 1):
@@ -387,7 +450,7 @@ def train():
     print(f"   Mean  : {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
 
-    # Final test
+    # Final test — use test data normalized with best fold's training stats
     model = FourStreamSTGCN(
         2, num_classes, GRAPH_ARGS,
         edge_importance_weighting=True,
@@ -400,8 +463,8 @@ def train():
     torch.save(best_state, MODEL_SAVE)
 
     test_loader = DataLoader(
-        FourStreamDataset(Xj_test, Xb_test, Xbm_test, y_test, augment=False),
-        batch_size=16, shuffle=False, num_workers=0
+        FourStreamDataset(best_Xj_test, best_Xb_test, best_Xbm_test, y_test, augment=False),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=0
     )
 
     model.eval()

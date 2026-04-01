@@ -46,14 +46,15 @@ class Model(nn.Module):
             self.bone_stream       = ST_GCN(*args, **kwargs_feat)
             self.bone_motion_stream= ST_GCN(*args, **kwargs_feat)
 
-            # Early fusion classifier: 4 streams × 256 → num_class
+            # Early fusion classifier: 4 streams × 128 → num_class
+            # (128-d per stream because st_gcn channels halved: 256→128)
             num_class = args[1]   # second positional arg
             self.fusion_fc = nn.Sequential(
-                nn.Linear(256 * 4, 512),
-                nn.LayerNorm(512),   # LayerNorm not BatchNorm — safe on batch size 1
+                nn.Linear(128 * 4, 256),
+                nn.LayerNorm(256),   # LayerNorm not BatchNorm — safe on batch size 1
                 nn.ReLU(inplace=True),
                 nn.Dropout(0.4),
-                nn.Linear(512, num_class)
+                nn.Linear(256, num_class)
             )
         else:
             # Late fusion: each stream outputs logits, sum at end

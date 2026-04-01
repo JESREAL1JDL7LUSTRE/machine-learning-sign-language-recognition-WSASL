@@ -66,18 +66,20 @@ class Model(nn.Module):
 
         kwargs0 = {k: v for k, v in kwargs.items() if k != 'dropout'}
 
-        # ── Original 10-layer architecture ────────────────────────────────────
+        # ── Reduced-width 10-layer architecture ───────────────────────────────
+        # Channels halved (64→32, 128→64, 256→128) — cuts params ~4×.
+        # With only ~300 training samples, smaller width generalizes better.
         self.st_gcn_networks = nn.ModuleList([
-            st_gcn(in_channels, 64,  kernel_size, 1, residual=False, **kwargs0),
-            st_gcn(64,          64,  kernel_size, 1, **kwargs),
+            st_gcn(in_channels, 32,  kernel_size, 1, residual=False, **kwargs0),
+            st_gcn(32,          32,  kernel_size, 1, **kwargs),
+            st_gcn(32,          32,  kernel_size, 1, **kwargs),
+            st_gcn(32,          32,  kernel_size, 1, **kwargs),
+            st_gcn(32,          64,  kernel_size, 2, **kwargs),
             st_gcn(64,          64,  kernel_size, 1, **kwargs),
             st_gcn(64,          64,  kernel_size, 1, **kwargs),
             st_gcn(64,          128, kernel_size, 2, **kwargs),
             st_gcn(128,         128, kernel_size, 1, **kwargs),
             st_gcn(128,         128, kernel_size, 1, **kwargs),
-            st_gcn(128,         256, kernel_size, 2, **kwargs),
-            st_gcn(256,         256, kernel_size, 1, **kwargs),
-            st_gcn(256,         256, kernel_size, 1, **kwargs),
         ])
 
         if edge_importance_weighting:
@@ -88,7 +90,7 @@ class Model(nn.Module):
         else:
             self.edge_importance = [1] * len(self.st_gcn_networks)
 
-        self.fcn = nn.Conv2d(256, num_class, kernel_size=1)
+        self.fcn = nn.Conv2d(128, num_class, kernel_size=1)
 
     def forward(self, x):
         N, C, T, V = x.size()
@@ -112,10 +114,10 @@ class Model(nn.Module):
             x, _ = gcn(x, A * importance)
 
         # ── Global average pool ───────────────────────────────────────────────
-        x = F.avg_pool2d(x, x.size()[2:])   # (N, 256, 1, 1)
+        x = F.avg_pool2d(x, x.size()[2:])   # (N, 128, 1, 1)
 
         if self.extract_features:
-            return x.view(N, -1)             # (N, 256) for early fusion
+            return x.view(N, -1)             # (N, 128) for early fusion
 
         x = self.fcn(x)
         return x.view(N, -1)                 # (N, num_class)
