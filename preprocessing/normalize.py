@@ -1,24 +1,3 @@
-"""
-normalize.py
-============
-Full preprocessing pipeline for MediaPipe 150-feature skeleton data.
-
-Steps:
-  1. Clean missing keypoints (interpolate zeros)
-  2. Filter to upper body + hands only (150 → 102 features)
-  3. Center on mid-hip
-  4. Scale by torso height
-  5. Make hand coords relative to their wrist root
-  6. Temporal smoothing (Gaussian)
-  7. Compute bone vectors, joint motion, bone motion (4 streams total)
-
-Output files:
-  X_normalized.npy  — joint positions  (N, T, 102)
-  X_bones.npy       — bone vectors     (N, T, 102)
-  X_motion.npy      — joint motion     (N, T, 102)
-  X_bone_motion.npy — bone motion      (N, T, 102)
-"""
-
 import numpy as np
 import os
 from scipy.ndimage import gaussian_filter1d

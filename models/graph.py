@@ -1,24 +1,9 @@
-"""
-graph.py
-========
-Original graph from Yan et al. ST-GCN (AAAI 2018).
-Extended with:
-  - mediapipe_51 layout
-  - Adaptive topology support (learnable adjacency matrix)
-  - DropGraph regularization
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
 
 
 class Graph():
-    """Skeleton graph builder.
-
-    Layouts: 'openpose', 'ntu-rgb+d', 'mediapipe_51'
-    Strategies: 'uniform', 'distance', 'spatial'
-    """
 
     def __init__(self, layout='mediapipe_51', strategy='spatial',
                  max_hop=1, dilation=1):
@@ -128,16 +113,6 @@ class Graph():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AdaptiveAdjacency(nn.Module):
-    """
-    Learnable adjacency matrix added on top of the fixed physical graph.
-
-    Based on: Zhang et al. STA-GCN (2020)
-    "The model learns data-dependent edge weights rather than relying
-    on fixed physical connections."
-
-    A_final = A_physical + alpha * A_learned
-    where A_learned is initialized near-zero and learned during training.
-    """
 
     def __init__(self, num_joints, num_subsets, alpha=0.1):
         super().__init__()
@@ -165,21 +140,7 @@ class AdaptiveAdjacency(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def drop_graph(x, drop_prob=0.1, training=True):
-    """
-    DropGraph: randomly zero out entire joint channels during training.
-    Based on: Jiang et al. "Skeleton Aware Multi-modal SLR" (2021)
 
-    "Selectively dropping noisy or irrelevant joints forces the model
-    to learn robust representations that don't over-rely on any single joint."
-
-    Args:
-        x         : (N, C, T, V) tensor
-        drop_prob : probability of dropping a joint (column in V dim)
-        training  : only apply during training
-
-    Returns:
-        (N, C, T, V) with some joint channels zeroed
-    """
     if not training or drop_prob == 0.0:
         return x
 

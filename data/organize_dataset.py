@@ -1,31 +1,3 @@
-"""
-organize_dataset.py
-───────────────────
-Reads WLASL_v0.3.json and organizes the flat videos/ folder
-into dataset/<gloss>/ subfolders ready for the pipeline.
-
-Place this file in:  data/organize_dataset.py
-
-Expected input structure (after Kaggle download):
-    data/
-        videos/          ← all .mp4 files named by video_id
-        WLASL_v0.3.json
-
-Output structure:
-    dataset/
-        hello/
-            00001.mp4
-            00045.mp4
-        book/
-            00003.mp4
-        ...
-
-Usage:
-    python data/organize_dataset.py
-    python data/organize_dataset.py --subset 100       ← only top 100 classes
-    python data/organize_dataset.py --split train      ← only train split
-"""
-
 import os
 import sys
 import json
@@ -42,14 +14,6 @@ DATASET_DIR = os.path.join(ROOT, "dataset")
 
 
 def organize(subset=None, split=None, copy=True):
-    """
-    Args:
-        subset : int or None — if set, only use the top-K glosses
-                 (e.g. 100 = WLASL100, 300 = WLASL300)
-        split  : str or None — filter by split ('train', 'val', 'test')
-                 None means include ALL splits
-        copy   : True = copy files (safe), False = move files (faster)
-    """
 
     # ── Load JSON ─────────────────────────────────────────────────────────────
     if not os.path.exists(JSON_PATH):

@@ -3,19 +3,7 @@ import os
 
 
 def temporal_resample(skeleton, target_len=64):
-    """
-    Resample a skeleton sequence to a fixed number of frames.
 
-    Uses linear index interpolation — works for both
-    upsampling (short videos) and downsampling (long videos).
-
-    Args:
-        skeleton   : numpy array of shape (T, F)
-        target_len : desired number of frames (default: 64)
-
-    Returns:
-        Resampled array of shape (target_len, F)
-    """
     T = len(skeleton)
 
     if T == target_len:
@@ -26,16 +14,7 @@ def temporal_resample(skeleton, target_len=64):
 
 
 def resample_dataset(X, target_len=64):
-    """
-    Apply temporal_resample to every sample in the dataset.
 
-    Args:
-        X          : numpy array of shape (N, T, F)  — T may vary if stored as object array
-        target_len : target number of frames
-
-    Returns:
-        numpy array of shape (N, target_len, F)
-    """
     resampled = []
 
     for i in range(len(X)):

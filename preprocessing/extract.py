@@ -1,21 +1,3 @@
-"""
-extract.py — Unified skeleton extractor for Sign Language Recognition
-======================================================================
-
-Supports two backends:
-  • mediapipe  (CPU only, best quality — 150 features)
-  • yolo       (GPU supported, faster — 118 features)
-
-Usage examples:
-  python preprocessing/extract.py                        # mediapipe, all classes
-  python preprocessing/extract.py 20                     # mediapipe, first 20 classes
-  python preprocessing/extract.py 20 --backend yolo      # yolo, first 20 classes
-  python preprocessing/extract.py --device cuda          # yolo + GPU (auto-switches to yolo)
-  python preprocessing/extract.py --device cpu           # mediapipe, CPU
-  python preprocessing/extract.py 20 --backend yolo --device cuda
-  python preprocessing/extract.py --frames 32            # custom frame count
-"""
-
 import cv2
 import numpy as np
 import os

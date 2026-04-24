@@ -1,24 +1,3 @@
-"""
-st_gcn_twostream.py
-===================
-Four-stream ST-GCN with early fusion.
-
-Streams:
-  1. Joint positions
-  2. Motion (second-order diff — original paper formula)
-  3. Bone vectors
-  4. Bone motion (Δbone over time)
-
-Fusion strategy (based on paper findings):
-  - Late fusion  : sum of final logits (original approach)
-  - Early fusion : concatenate 256-d features BEFORE classifier,
-                   then a shared FC maps to num_class.
-                   This allows streams to interact — addresses the
-                   "late fusion bottleneck" identified in the paper.
-
-Based on: Yan et al. AAAI 2018 + Jiang et al. 2021 + Zhang et al. 2020
-"""
-
 import torch
 import torch.nn as nn
 
@@ -26,12 +5,6 @@ from models.st_gcn import Model as ST_GCN
 
 
 class Model(nn.Module):
-    """Four-stream ST-GCN with early fusion.
-
-    Input  : joint (N,C,T,V), bone (N,C,T,V), motion computed internally,
-             bone_motion (N,C,T,V)
-    Output : (N, num_class)
-    """
 
     def __init__(self, *args, early_fusion=True, **kwargs):
         super().__init__()
@@ -64,7 +37,6 @@ class Model(nn.Module):
             self.bone_motion_stream= ST_GCN(*args, **kwargs)
 
     def _compute_motion(self, x):
-        """Second-order motion (original paper formula)."""
         N, C, T, V = x.size()
         zeros = torch.zeros(N, C, 1, V, device=x.device, dtype=x.dtype)
         return torch.cat([
@@ -74,12 +46,6 @@ class Model(nn.Module):
         ], dim=2)
 
     def forward(self, x, bone=None, bone_motion=None):
-        """
-        Args:
-            x           : joint positions   (N, C, T, V)
-            bone        : bone vectors       (N, C, T, V)
-            bone_motion : bone motion stream (N, C, T, V)
-        """
         # Compute second-order motion internally (original paper style)
         motion = self._compute_motion(x)
 
