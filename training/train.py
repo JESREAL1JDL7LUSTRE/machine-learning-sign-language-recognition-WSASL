@@ -73,6 +73,46 @@ def compute_class_weights(y, num_classes, device):
 
 def augment_skeleton(x):
     T, F = x.shape
+    V = F // 2
+
+    def random_move(seq):
+        angle_candidate = [-10.0, -5.0, 0.0, 5.0, 10.0]
+        scale_candidate = [0.9, 1.0, 1.1]
+        trans_candidate = [-0.2, -0.1, 0.0, 0.1, 0.2]
+
+        move_time = 1
+        node = np.arange(0, T, max(1, int(T / move_time))).round().astype(int)
+        node = np.append(node, T)
+        num_node = len(node)
+
+        A = np.random.choice(angle_candidate, num_node)
+        S = np.random.choice(scale_candidate, num_node)
+        Tx = np.random.choice(trans_candidate, num_node)
+        Ty = np.random.choice(trans_candidate, num_node)
+
+        a = np.zeros(T)
+        s = np.zeros(T)
+        t_x = np.zeros(T)
+        t_y = np.zeros(T)
+
+        for i in range(num_node - 1):
+            st, ed = node[i], node[i + 1]
+            a[st:ed] = np.linspace(A[i], A[i + 1], ed - st) * np.pi / 180
+            s[st:ed] = np.linspace(S[i], S[i + 1], ed - st)
+            t_x[st:ed] = np.linspace(Tx[i], Tx[i + 1], ed - st)
+            t_y[st:ed] = np.linspace(Ty[i], Ty[i + 1], ed - st)
+
+        seq2 = seq.copy().reshape(T, V, 2)
+        for i in range(T):
+            ca, sa = np.cos(a[i]) * s[i], np.sin(a[i]) * s[i]
+            rot = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
+            xy = seq2[i].reshape(V, 2).T
+            moved = rot @ xy
+            moved[0] += t_x[i]
+            moved[1] += t_y[i]
+            seq2[i] = moved.T
+        return seq2.reshape(T, F)
+
     if np.random.rand() < 0.6:
         x = x + np.random.randn(*x.shape).astype(np.float32) * 0.015
     if np.random.rand() < 0.5:
@@ -101,12 +141,15 @@ def augment_skeleton(x):
         st = np.random.randint(0, T - cl + 1)
         cr = x[st:st+cl]
         x = cr[np.linspace(0, len(cr)-1, T).astype(int)]
+    if np.random.rand() < 0.35:
+        x = random_move(x)
     return x.astype(np.float32)
 
 
 class FourStreamDataset(Dataset):
-    def __init__(self, X_joint, X_bone, X_bone_motion, y, augment=False):
+    def __init__(self, X_joint, X_motion, X_bone, X_bone_motion, y, augment=False):
         self.X_joint = X_joint.astype(np.float32)
+        self.X_motion = X_motion.astype(np.float32)
         self.X_bone  = X_bone.astype(np.float32)
         self.X_bm    = X_bone_motion.astype(np.float32)
         self.y       = y.astype(np.int64)
@@ -121,15 +164,18 @@ class FourStreamDataset(Dataset):
 
     def __getitem__(self, idx):
         xj = self.X_joint[idx].copy()
+        xmj = self.X_motion[idx].copy()
         xb = self.X_bone[idx].copy()
-        xm = self.X_bm[idx].copy()
+        xbm = self.X_bm[idx].copy()
         if self.augment:
             xj = augment_skeleton(xj)
+            xmj = augment_skeleton(xmj)
             xb = augment_skeleton(xb)
-            xm = augment_skeleton(xm)
+            xbm = augment_skeleton(xbm)
         return (torch.tensor(self.to_graph(xj), dtype=torch.float32),
+                torch.tensor(self.to_graph(xmj), dtype=torch.float32),
                 torch.tensor(self.to_graph(xb), dtype=torch.float32),
-                torch.tensor(self.to_graph(xm), dtype=torch.float32),
+                torch.tensor(self.to_graph(xbm), dtype=torch.float32),
                 torch.tensor(self.y[idx],        dtype=torch.long))
 
 
@@ -160,34 +206,35 @@ def load_data():
         return np.zeros_like(X_joint)
 
     X_bone = ls("X_bones.npy",       "Bone stream")
+    X_motion = ls("X_motion.npy",      "Joint motion")
     X_bm   = ls("X_bone_motion.npy", "Bone motion")
     u, c   = np.unique(y, return_counts=True)
     print(f"\n  X shape  : {X_joint.shape}")
     print(f"  Classes  : {len(u)} | min: {c.min()} | max: {c.max()} | mean: {c.mean():.1f}")
-    return X_joint, X_bone, X_bm, y
+    return X_joint, X_motion, X_bone, X_bm, y
 
 
 def eval_model(m, val_loader):
     m.eval()
     correct = 0
     with torch.no_grad():
-        for xj, xb, xbm, yb in val_loader:
-            xj, xb, xbm, yb = (xj.to(DEVICE), xb.to(DEVICE),
-                                xbm.to(DEVICE), yb.to(DEVICE))
-            correct += (m(xj, bone=xb, bone_motion=xbm)
+        for xj, xmj, xb, xbm, yb in val_loader:
+            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
+                                    xbm.to(DEVICE), yb.to(DEVICE))
+            correct += (m(xj, motion=xmj, bone=xb, bone_motion=xbm)
                         .argmax(1) == yb).sum().item()
     return correct / len(val_loader.dataset)
 
 
-def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
-               Xj_val, Xb_val, Xbm_val, y_val,
+def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
+               Xj_val, Xm_val, Xb_val, Xbm_val, y_val,
                num_classes, fold):
 
     train_loader = DataLoader(
-        FourStreamDataset(Xj_tr, Xb_tr, Xbm_tr, y_tr, augment=True),
+        FourStreamDataset(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr, augment=True),
         batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True)
     val_loader = DataLoader(
-        FourStreamDataset(Xj_val, Xb_val, Xbm_val, y_val, augment=False),
+        FourStreamDataset(Xj_val, Xm_val, Xb_val, Xbm_val, y_val, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
 
     model = FourStreamSTGCN(
@@ -226,11 +273,11 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         tr_correct = 0
-        for xj, xb, xbm, yb in train_loader:
-            xj, xb, xbm, yb = (xj.to(DEVICE), xb.to(DEVICE),
-                                xbm.to(DEVICE), yb.to(DEVICE))
+        for xj, xmj, xb, xbm, yb in train_loader:
+            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
+                                    xbm.to(DEVICE), yb.to(DEVICE))
             optimizer.zero_grad()
-            out = model(xj, bone=xb, bone_motion=xbm)
+            out = model(xj, motion=xmj, bone=xb, bone_motion=xbm)
             criterion(out, yb).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -295,7 +342,7 @@ def train_fold(Xj_tr, Xb_tr, Xbm_tr, y_tr,
 
 def train():
     print("\nLoading data streams...")
-    X_joint, X_bone, X_bm, y = load_data()
+    X_joint, X_motion, X_bone, X_bm, y = load_data()
     num_classes = len(np.unique(y))
 
     _m = FourStreamSTGCN(2, num_classes, GRAPH_ARGS,
@@ -313,8 +360,10 @@ def train():
     idx_tv, idx_test = train_test_split(idx_all, test_size=TEST_SPLIT,
                                         random_state=SEED, stratify=y)
     Xj_test  = X_joint[idx_test]; Xb_test  = X_bone[idx_test]
+    Xm_test  = X_motion[idx_test]
     Xbm_test = X_bm[idx_test];    y_test   = y[idx_test]
     Xj_tv    = X_joint[idx_tv];   Xb_tv    = X_bone[idx_tv]
+    Xm_tv    = X_motion[idx_tv]
     Xbm_tv   = X_bm[idx_tv];      y_tv     = y[idx_tv]
 
     np.save(os.path.join(OUTPUT_DIR, "X_test.npy"), Xj_test)
@@ -331,14 +380,16 @@ def train():
     for fold, (tr_idx, val_idx) in enumerate(skf.split(Xj_tv, y_tv), 1):
         Xj_tr_n,  Xj_val_n,  Xj_test_n  = global_normalize(
             Xj_tv[tr_idx],  Xj_tv[val_idx],  Xj_test)
+        Xm_tr_n,  Xm_val_n,  Xm_test_n  = global_normalize(
+            Xm_tv[tr_idx],  Xm_tv[val_idx],  Xm_test)
         Xb_tr_n,  Xb_val_n,  Xb_test_n  = global_normalize(
             Xb_tv[tr_idx],  Xb_tv[val_idx],  Xb_test)
         Xbm_tr_n, Xbm_val_n, Xbm_test_n = global_normalize(
             Xbm_tv[tr_idx], Xbm_tv[val_idx], Xbm_test)
 
         val_acc, state = train_fold(
-            Xj_tr_n, Xb_tr_n, Xbm_tr_n, y_tv[tr_idx],
-            Xj_val_n, Xb_val_n, Xbm_val_n, y_tv[val_idx],
+            Xj_tr_n, Xm_tr_n, Xb_tr_n, Xbm_tr_n, y_tv[tr_idx],
+            Xj_val_n, Xm_val_n, Xb_val_n, Xbm_val_n, y_tv[val_idx],
             num_classes, fold)
         fold_accs.append(val_acc)
         print(f"  Fold {fold} best val acc: {val_acc:.3f}")
@@ -347,6 +398,7 @@ def train():
             best_acc      = val_acc
             best_state    = state
             best_Xj_test  = Xj_test_n
+            best_Xm_test  = Xm_test_n
             best_Xb_test  = Xb_test_n
             best_Xbm_test = Xbm_test_n
 
@@ -364,17 +416,17 @@ def train():
     torch.save(best_state, MODEL_SAVE)
 
     test_loader = DataLoader(
-        FourStreamDataset(best_Xj_test, best_Xb_test, best_Xbm_test,
+        FourStreamDataset(best_Xj_test, best_Xm_test, best_Xb_test, best_Xbm_test,
                           y_test, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     tc = 0
     model.eval()
     with torch.no_grad():
-        for xj, xb, xbm, yb in test_loader:
-            xj, xb, xbm, yb = (xj.to(DEVICE), xb.to(DEVICE),
-                                xbm.to(DEVICE), yb.to(DEVICE))
-            tc += (model(xj, bone=xb, bone_motion=xbm)
+        for xj, xmj, xb, xbm, yb in test_loader:
+            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
+                                    xbm.to(DEVICE), yb.to(DEVICE))
+            tc += (model(xj, motion=xmj, bone=xb, bone_motion=xbm)
                    .argmax(1) == yb).sum().item()
 
     print(f"\n── Final Test Set Evaluation ───────────────────────")

@@ -45,9 +45,10 @@ class Model(nn.Module):
             zeros
         ], dim=2)
 
-    def forward(self, x, bone=None, bone_motion=None):
-        # Compute second-order motion internally (original paper style)
-        motion = self._compute_motion(x)
+    def forward(self, x, motion=None, bone=None, bone_motion=None):
+        # Use externally precomputed motion if provided; otherwise fallback.
+        if motion is None:
+            motion = self._compute_motion(x)
 
         # Fallback zeros if streams not provided
         if bone is None:
