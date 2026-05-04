@@ -606,8 +606,8 @@ def _run_kfold(make_model_fn, forward_fn, dataset_cls, X_arrays, y,
             std  = np.where(std < 1e-6, 1.0, std)
             norms.append((mean, std))
             results.append(tuple((X[idx] - mean) / std for idx in idxs))
-        # Transpose: list of tuples → tuple of lists
-        return list(zip(*results))
+        # Return per-stream tuples: results[i] = (tr_norm, val_norm, test_norm)
+        return results
 
     test_arrays  = [X[idx_test] for X in X_arrays]
     tv_arrays    = [X[idx_tv]   for X in X_arrays]

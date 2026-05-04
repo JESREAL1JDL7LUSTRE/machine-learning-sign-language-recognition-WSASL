@@ -51,4 +51,33 @@ python preprocessing/resample.py
 **Step 7 — Train**
 ```bash
 python training/train.py
+
+---
+Additional `main.py` commands
+```bash
+# Retrain all models (ignore cache)
+python main.py --compare-5 --force
+
+# Quick smoke test (2 epochs)
+python main.py --compare-5 --epochs 2 --force
+
+# Retrain a single model
+python main.py --bilstm --force
+
+# Generate charts only from cached results
+python main.py --compare-5 --results-only
+
+# Skip chart generation (headless)
+python main.py --compare-5 --no-charts
+
+# Force device
+python main.py --compare-5 --device cpu
+python main.py --compare-5 --device cuda
+
+# Remove cached results (PowerShell)
+Remove-Item output\model_results.json
+
+# Remove cached results (CMD)
+del output\model_results.json
+```
 ```
