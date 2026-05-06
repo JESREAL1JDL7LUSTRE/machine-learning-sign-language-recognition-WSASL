@@ -36,8 +36,6 @@ import matplotlib.gridspec as gridspec
 ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
-from models.bilstm_mediapipe    import BiLSTMSign
-from models.stgcn_single        import SingleStreamSTGCN
 from models.stgcn               import STGCN, NUM_JOINTS
 from models.stgcn_2stream_ported import TwoStreamPortedSTGCN
 from models.st_gcn_twostream    import Model as FourStreamSTGCN
@@ -65,15 +63,12 @@ DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Published / known results (for reference lines in charts) ──────────────────
 PUBLISHED = {
-    "bilstm":             {"test": 0.268, "cv": None,  "label": "BiLSTM\n(MediaPipe)"},
-    "custom-stgcn":       {"test": 0.333, "cv": None,  "label": "Custom\nST-GCN"},
     "multi-stream-stgcn": {"test": 0.452, "cv": 0.624, "label": "Multi-Stream\nST-GCN (3s)"},
     "2stream-stgcn":      {"test": 0.387, "cv": 0.518, "label": "2-Stream\nST-GCN (ported)"},
     "4stream-fusion":     {"test": 0.484, "cv": 0.512, "label": "4-Stream\nEarly Fusion"},
 }
 
-MODEL_ORDER = ["bilstm", "custom-stgcn", "multi-stream-stgcn",
-               "2stream-stgcn", "4stream-fusion"]
+MODEL_ORDER = ["multi-stream-stgcn", "2stream-stgcn", "4stream-fusion"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,37 +186,7 @@ def _to_graph(x):
     return x.reshape(T, V, 2).transpose(2, 0, 1)          # (2, T, V)
 
 
-class FlatDataset(Dataset):
-    """For BiLSTM — returns flat (T, F) feature vectors."""
-    def __init__(self, X, y, augment=False):
-        self.X       = X.astype(np.float32)
-        self.y       = y.astype(np.int64)
-        self.augment = augment
-
-    def __len__(self): return len(self.y)
-
-    def __getitem__(self, i):
-        x = self.X[i].copy()
-        if self.augment:
-            x = augment_skeleton(x)
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(self.y[i])
-
-
-class SingleGraphDataset(Dataset):
-    """For single-stream ST-GCN — returns (2, T, V) joint graph."""
-    def __init__(self, X_joint, y, augment=False):
-        self.X_joint = X_joint.astype(np.float32)
-        self.y       = y.astype(np.int64)
-        self.augment = augment
-
-    def __len__(self): return len(self.y)
-
-    def __getitem__(self, i):
-        xj = self.X_joint[i].copy()
-        if self.augment:
-            xj = augment_skeleton(xj)
-        return (torch.tensor(_to_graph(xj), dtype=torch.float32),
-                torch.tensor(self.y[i]))
+# Removed FlatDataset and SingleGraphDataset (BiLSTM and single-stream ST-GCN removed)
 
 
 class ThreeStreamDataset(Dataset):
@@ -458,53 +423,7 @@ def train_one_fold(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODEL RUNNERS  (one per model type)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def run_bilstm(X_joint, X_bone, X_motion, X_bm, y, epochs, device, label_map):
-    """BiLSTM on flat joint features."""
-    num_classes = len(np.unique(y))
-    in_size     = X_joint.shape[-1]
-
-    def make_model():
-        return BiLSTMSign(
-            input_size  = in_size,
-            hidden_size = 128,
-            num_layers  = 2,
-            num_classes = num_classes,
-            dropout     = DROPOUT,
-        ).to(device)
-
-    def forward_fn(model, inputs):
-        return model(inputs[0])          # (batch, T, F)
-
-    return _run_kfold(
-        make_model, forward_fn,
-        FlatDataset, (X_joint,), y,
-        num_classes, epochs, device, label_map,
-    )
-
-
-def run_custom_stgcn(X_joint, X_bone, X_motion, X_bm, y, epochs, device, label_map):
-    """Single-stream custom ST-GCN."""
-    num_classes = len(np.unique(y))
-
-    def make_model():
-        return SingleStreamSTGCN(
-            num_classes = num_classes,
-            num_joints  = NUM_JOINTS,
-            dropout     = DROPOUT,
-        ).to(device)
-
-    def forward_fn(model, inputs):
-        return model(inputs[0])          # (N, 2, T, V)
-
-    return _run_kfold(
-        make_model, forward_fn,
-        SingleGraphDataset, (X_joint,), y,
-        num_classes, epochs, device, label_map,
-    )
-
+# Note: BiLSTM and single-stream ST-GCN runners have been removed.
 
 def run_multi_stream_stgcn(X_joint, X_bone, X_motion, X_bm, y, epochs, device, label_map):
     """3-stream ST-GCN (joint + bone + motion)."""
@@ -617,6 +536,8 @@ def _run_kfold(make_model_fn, forward_fn, dataset_cls, X_arrays, y,
     skf       = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
     fold_accs = []
     fold_histories = []
+    cv_preds_all = []
+    cv_labels_all = []
     best_overall_acc = 0.0
     best_state_global = None
     best_test_arrays_norm = None
@@ -643,6 +564,11 @@ def _run_kfold(make_model_fn, forward_fn, dataset_cls, X_arrays, y,
         fold_accs.append(val_acc)
         fold_histories.append(history)
         print(f"  Fold {fold} best val acc: {val_acc:.3f}")
+
+        # Collect CV predictions for per-class analysis
+        val_preds, val_labels = _eval_loop(model, val_loader, forward_fn, device)
+        cv_preds_all.extend(val_preds.tolist())
+        cv_labels_all.extend(val_labels.tolist())
 
         if val_acc > best_overall_acc:
             best_overall_acc  = val_acc
@@ -674,6 +600,8 @@ def _run_kfold(make_model_fn, forward_fn, dataset_cls, X_arrays, y,
         "test_acc":        float(test_acc),
         "all_preds":       all_preds.tolist(),
         "all_labels":      all_labels.tolist(),
+        "cv_preds":        cv_preds_all,
+        "cv_labels":       cv_labels_all,
         "num_classes":     num_classes,
         "fold_histories":  fold_histories,
         "label_map":       label_map,
@@ -685,16 +613,12 @@ def _run_kfold(make_model_fn, forward_fn, dataset_cls, X_arrays, y,
 # ══════════════════════════════════════════════════════════════════════════════
 
 COLORS = {
-    "bilstm":             "#4C72B0",
-    "custom-stgcn":       "#DD8452",
     "multi-stream-stgcn": "#55A868",
     "2stream-stgcn":      "#C44E52",
     "4stream-fusion":     "#8172B2",
 }
 
 FULL_NAMES = {
-    "bilstm":             "BiLSTM (MediaPipe)",
-    "custom-stgcn":       "Custom ST-GCN\n(Single Stream)",
     "multi-stream-stgcn": "Multi-Stream ST-GCN\n(3-Stream)",
     "2stream-stgcn":      "Original 2-Stream\nST-GCN (Ported)",
     "4stream-fusion":     "4-Stream Early\nFusion (Current)",
@@ -703,6 +627,7 @@ FULL_NAMES = {
 
 def plot_model_results(key, results, save_path):
     """Generate a 4-panel per-model results figure."""
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     pub     = PUBLISHED[key]
     color   = COLORS[key]
     n_cls   = results["num_classes"]
@@ -775,28 +700,58 @@ def plot_model_results(key, results, save_path):
     # ── Panel 4: Per-class accuracy bar chart ─────────────────────────────────
     ax4 = fig.add_subplot(gs[1, :2])
     ax4.set_facecolor("#FFFFFF")
-    per_class_acc = []
+    # Prefer CV data for per-class accuracy (more samples per class)
+    per_src_preds = np.array(results.get("cv_preds", all_preds))
+    per_src_labels = np.array(results.get("cv_labels", all_labels))
+
     label_map = results.get("label_map", {})
     idx_to_label = {v: k for k, v in label_map.items()} if label_map else {}
+    counts = np.bincount(per_src_labels, minlength=n_cls)
+    present = counts > 0
+    per_class_acc = np.full(n_cls, np.nan, dtype=np.float32)
     for cls_id in range(n_cls):
-        mask = all_labels == cls_id
-        if mask.sum() == 0:
-            per_class_acc.append(0.0)
-        else:
-            per_class_acc.append((all_preds[mask] == cls_id).mean())
+        if present[cls_id]:
+            mask = per_src_labels == cls_id
+            per_class_acc[cls_id] = (per_src_preds[mask] == cls_id).mean()
     cls_labels = [idx_to_label.get(i, str(i)) for i in range(n_cls)]
-    bar_colors = [color if a >= np.mean(per_class_acc) else "#CCCCCC"
+    mean_acc = float(np.nanmean(per_class_acc)) if np.any(present) else 0.0
+    plot_vals = np.where(np.isnan(per_class_acc), 0.0, per_class_acc)
+    bar_colors = [color if (not np.isnan(a) and a >= mean_acc) else "#CCCCCC"
                   for a in per_class_acc]
-    ax4.bar(range(n_cls), per_class_acc, color=bar_colors, alpha=0.85)
-    ax4.axhline(np.mean(per_class_acc), color="#333333", ls="--", lw=1.5,
-                label=f"Mean {np.mean(per_class_acc):.3f}")
+    ax4.bar(range(n_cls), plot_vals, color=bar_colors, alpha=0.85)
+    missing_count = int((~present).sum())
+    ax4.axhline(mean_acc, color="#333333", ls="--", lw=1.5,
+                label=f"Mean {mean_acc:.3f} (present only)")
+    if missing_count:
+        ax4.text(0.99, 0.97, f"Missing classes: {missing_count}",
+                 transform=ax4.transAxes, ha="right", va="top", fontsize=8,
+                 color="#444444")
     ax4.set_xticks(range(n_cls))
     ax4.set_xticklabels(cls_labels, rotation=90, fontsize=6 if n_cls > 30 else 8)
     ax4.set_ylabel("Accuracy")
-    ax4.set_title("Per-Class Accuracy (Test Set)", fontweight="bold")
+    src_name = "CV" if "cv_preds" in results else "Test"
+    ax4.set_title(f"Per-Class Accuracy ({src_name})", fontweight="bold")
     ax4.legend(fontsize=8)
     ax4.set_ylim(0, 1.15)
     ax4.grid(axis="y", alpha=0.25)
+
+    # Add a compact summary of non-zero classes to make small signals visible
+    nonzero = [(i, float(per_class_acc[i]), int(counts[i]))
+               for i in range(n_cls)
+               if present[i] and not np.isnan(per_class_acc[i]) and per_class_acc[i] > 0]
+    if nonzero:
+        nonzero.sort(key=lambda x: (-x[1], -x[2]))
+        top = nonzero[:10]
+        lines = [
+            "Nonzero classes (top 10):",
+            *[
+                f"{idx_to_label.get(i, i)}: {acc:.2f} ({cnt})"
+                for i, acc, cnt in top
+            ],
+        ]
+        ax4.text(0.99, 0.55, "\n".join(lines), transform=ax4.transAxes,
+                 ha="right", va="top", fontsize=7, color="#333333",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFFFFF", alpha=0.7))
 
     # ── Panel 5: Summary stats box ────────────────────────────────────────────
     ax5 = fig.add_subplot(gs[1, 2])
@@ -847,6 +802,7 @@ def plot_model_results(key, results, save_path):
 
 def plot_comparison_overview(all_results, save_path):
     """Generate the 5-model comparison overview figure."""
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     keys      = [k for k in MODEL_ORDER if k in all_results]
     names     = [FULL_NAMES[k].replace("\n", " ") for k in keys]
     colors    = [COLORS[k] for k in keys]
@@ -1013,8 +969,6 @@ def save_results_cache(cache):
 # ══════════════════════════════════════════════════════════════════════════════
 
 MODEL_RUNNERS = {
-    "bilstm":             run_bilstm,
-    "custom-stgcn":       run_custom_stgcn,
     "multi-stream-stgcn": run_multi_stream_stgcn,
     "2stream-stgcn":      run_2stream_stgcn,
     "4stream-fusion":     run_4stream_fusion,
@@ -1063,10 +1017,6 @@ Examples:
     )
 
     # ── Model selection ────────────────────────────────────────────────────────
-    parser.add_argument("--bilstm",              action="store_true",
-                        help="Run BiLSTM (MediaPipe, 102 features)")
-    parser.add_argument("--custom-stgcn",        action="store_true",
-                        help="Run Custom Single-Stream ST-GCN")
     parser.add_argument("--multi-stream-stgcn",  action="store_true",
                         help="Run Multi-Stream ST-GCN (3-stream: joint+bone+motion)")
     # NOTE: --2stream-stgcn / --4stream-fusion are rewritten to these before argparse
@@ -1101,25 +1051,16 @@ Examples:
 
     # ── Determine which models to run ──────────────────────────────────────────
     selected = []
-    if args.compare_5 or not any([
-        args.bilstm, args.custom_stgcn, args.multi_stream_stgcn,
-        args.two_stream_stgcn if hasattr(args, "two_stream_stgcn") else False,
-        args.four_stream_fusion if hasattr(args, "four_stream_fusion") else False,
-    ]):
-        pass  # handled below
-
     if args.compare_5:
         selected = MODEL_ORDER[:]
     else:
-        if args.bilstm:             selected.append("bilstm")
-        if args.custom_stgcn:       selected.append("custom-stgcn")
         if args.multi_stream_stgcn: selected.append("multi-stream-stgcn")
         if args.xstream_stgcn_2:    selected.append("2stream-stgcn")
         if args.xstream_fusion_4:   selected.append("4stream-fusion")
 
     if not selected:
         parser.print_help()
-        print("\nNo model selected. Use --bilstm, --compare-5, etc.")
+        print("\nNo model selected. Use --multi-stream-stgcn, --compare-5, etc.")
         sys.exit(0)
 
     print(f"  Models  : {selected}")
