@@ -1,8 +1,30 @@
 """
-train.py — Four-stream ST-GCN, optimized for 20/50-class WLASL.
+train.py — Standalone Training Script for the Four-Stream ST-GCN
+================================================================
 
-SWA fix: accumulate weights throughout training, do ONE update_bn at the end,
-evaluate SWA model once after early stopping fires. No per-epoch BN resets.
+This is the dedicated training script for the FourStreamSTGCN model
+(models/st_gcn_twostream.py) with early fusion.
+
+Four input streams fed simultaneously:
+    joint      — normalized (x,y) joint positions  (N, 2, T, 51)
+    motion     — frame-to-frame joint delta         (N, 2, T, 51)
+    bone       — child-minus-parent bone vectors    (N, 2, T, 51)
+    bone_motion— frame-to-frame bone delta          (N, 2, T, 51)
+
+Training strategy:
+    - Stratified 85/15 train+val / test split (held-out before CV)
+    - 4-Fold Stratified K-Fold Cross-Validation
+    - Per-fold global z-score normalization (train stats only)
+    - Heavy data augmentation on all four streams simultaneously
+    - Label Smoothing loss with inverse-frequency class weights
+    - AdamW optimizer with warmup-cosine LR schedule
+    - Stochastic Weight Averaging (SWA) from epoch 50
+    - Early stopping with patience=35
+    - Gradient clipping (max_norm=1.0)
+    - Best fold weights saved to models/sign_stgcn.pth
+
+SWA note: Accumulate weights throughout training, do ONE update_bn at the
+end, evaluate SWA model once after early stopping fires. No per-epoch BN resets.
 """
 
 import os, sys
@@ -45,6 +67,20 @@ print(f"Using device: {DEVICE}")
 
 
 class LabelSmoothingLoss(nn.Module):
+    """Cross-entropy with label smoothing and optional per-class weighting.
+
+    Label smoothing prevents overconfidence by distributing probability mass:
+        smoothed_target[y]   = 1.0 - smoothing
+        smoothed_target[k≠y] = smoothing / (K - 1)
+
+    Per-class weights compensate for class imbalance: rare classes receive
+    higher loss weight so the model pays equal attention to all classes.
+
+    Args:
+        num_classes (int)  : Total number of output classes K.
+        smoothing   (float): Label smoothing factor ε. Default: 0.1.
+        weight      (Tensor|None): Per-class weights of shape (K,).
+    """
     def __init__(self, num_classes, smoothing=0.1, weight=None):
         super().__init__()
         self.smoothing = smoothing
@@ -52,22 +88,46 @@ class LabelSmoothingLoss(nn.Module):
         self.weight = weight
 
     def forward(self, pred, target):
+        """Compute smoothed cross-entropy loss.
+
+        Args:
+            pred   (Tensor): Logits, shape (N, K).
+            target (Tensor): Ground-truth labels, shape (N,), dtype long.
+
+        Returns:
+            Tensor: Scalar loss.
+        """
         log_prob = F.log_softmax(pred, dim=1)
         with torch.no_grad():
+            # Build smoothed target distribution
             smooth = torch.zeros_like(log_prob)
-            smooth.fill_(self.smoothing / (self.num_classes - 1))
-            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+            smooth.fill_(self.smoothing / (self.num_classes - 1))  # background mass
+            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)  # true class mass
         if self.weight is not None:
+            # Scale each sample's loss by the per-class weight of its true label
             w = self.weight[target].unsqueeze(1)
             return -(smooth * log_prob * w).sum(dim=1).mean()
         return -(smooth * log_prob).sum(dim=1).mean()
 
 
 def compute_class_weights(y, num_classes, device):
+    """Compute inverse-frequency class weights for imbalanced datasets.
+
+    Weight for class k = 1/count_k, then normalized so weights sum to num_classes.
+    Classes with zero samples get weight 1 (neutral) to avoid division by zero.
+
+    Args:
+        y           (np.ndarray): Integer label array.
+        num_classes (int)       : Total number of classes.
+        device      (torch.device): Target device for the weight tensor.
+
+    Returns:
+        Tensor: Per-class weights, shape (num_classes,), float32.
+    """
     counts  = np.bincount(y, minlength=num_classes).astype(np.float32)
-    counts  = np.where(counts == 0, 1, counts)
-    weights = 1.0 / counts
-    weights = weights / weights.sum() * num_classes
+    counts  = np.where(counts == 0, 1, counts)   # avoid div-by-zero for empty classes
+    weights = 1.0 / counts                        # inverse frequency
+    weights = weights / weights.sum() * num_classes  # normalize so mean weight = 1
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
@@ -147,6 +207,17 @@ def augment_skeleton(x):
 
 
 class FourStreamDataset(Dataset):
+    """PyTorch Dataset for four-stream skeleton data (joint, motion, bone, bone_motion).
+
+    Each sample returns four graph-format tensors, one per stream, plus the label.
+    The to_graph() method reshapes flat (T, F) sequences to (2, T, V) graph format
+    required by the ST-GCN model.
+
+    Args:
+        X_joint, X_motion, X_bone, X_bone_motion: Each shape (N, T, 102).
+        y       (np.ndarray): Integer labels, shape (N,).
+        augment (bool)      : Apply heavy augmentation if True (training only).
+    """
     def __init__(self, X_joint, X_motion, X_bone, X_bone_motion, y, augment=False):
         self.X_joint = X_joint.astype(np.float32)
         self.X_motion = X_motion.astype(np.float32)
@@ -158,31 +229,59 @@ class FourStreamDataset(Dataset):
     def __len__(self): return len(self.y)
 
     def to_graph(self, x):
+        """Convert flat skeleton (T, F) to ST-GCN graph format (2, T, V).
+
+        F = V * 2 (each joint has x and y coordinate).
+        The model expects channels (x, y) first, then time, then joints.
+
+        Args:
+            x (np.ndarray): Shape (T, F=102).
+
+        Returns:
+            np.ndarray: Shape (2, T, 51) — (channels, frames, joints).
+        """
         T, F = x.shape
-        V = F // 2
+        V = F // 2   # 51 joints
+        # Reshape: (T, F) → (T, V, 2) → transpose → (2, T, V)
         return x.reshape(T, V, 2).transpose(2, 0, 1)
 
     def __getitem__(self, idx):
+        """Return one sample: four graph tensors + class label."""
         xj = self.X_joint[idx].copy()
         xmj = self.X_motion[idx].copy()
         xb = self.X_bone[idx].copy()
         xbm = self.X_bm[idx].copy()
         if self.augment:
+            # Apply same augmentation independently to all four streams
             xj = augment_skeleton(xj)
             xmj = augment_skeleton(xmj)
             xb = augment_skeleton(xb)
             xbm = augment_skeleton(xbm)
-        return (torch.tensor(self.to_graph(xj), dtype=torch.float32),
+        # Convert all streams to (2, T, V) graph tensors
+        return (torch.tensor(self.to_graph(xj),  dtype=torch.float32),
                 torch.tensor(self.to_graph(xmj), dtype=torch.float32),
-                torch.tensor(self.to_graph(xb), dtype=torch.float32),
+                torch.tensor(self.to_graph(xb),  dtype=torch.float32),
                 torch.tensor(self.to_graph(xbm), dtype=torch.float32),
-                torch.tensor(self.y[idx],        dtype=torch.long))
+                torch.tensor(self.y[idx],         dtype=torch.long))
 
 
 def global_normalize(X_tr, *X_others):
-    mean = X_tr.mean(axis=(0, 1), keepdims=True)
-    std  = X_tr.std(axis=(0, 1),  keepdims=True)
-    std  = np.where(std < 1e-6, 1.0, std)
+    """Z-score normalize using training-split mean and std.
+
+    Computes mean and std from X_tr only (no leakage), then applies the
+    same transformation to all other arrays (e.g. val, test splits).
+    Features with std < 1e-6 are left unchanged (division by 1.0).
+
+    Args:
+        X_tr     (np.ndarray): Training split, shape (N_tr, T, F).
+        *X_others             : Additional arrays to normalize with same stats.
+
+    Returns:
+        Tuple of normalized arrays in the same order as inputs.
+    """
+    mean = X_tr.mean(axis=(0, 1), keepdims=True)   # mean per feature (T-averaged)
+    std  = X_tr.std(axis=(0, 1),  keepdims=True)    # std per feature
+    std  = np.where(std < 1e-6, 1.0, std)           # avoid division by zero
     return ((X_tr - mean) / std,) + tuple((X - mean) / std for X in X_others)
 
 
