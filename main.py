@@ -66,9 +66,10 @@ PUBLISHED = {
     "multi-stream-stgcn": {"test": 0.452, "cv": 0.624, "label": "Multi-Stream\nST-GCN (3s)"},
     "2stream-stgcn":      {"test": 0.387, "cv": 0.518, "label": "2-Stream\nST-GCN (ported)"},
     "4stream-fusion":     {"test": 0.484, "cv": 0.512, "label": "4-Stream\nEarly Fusion"},
+    "4stream-late-fusion":{"test": None,  "cv": None,  "label": "4-Stream\nLate Fusion"},
 }
 
-MODEL_ORDER = ["multi-stream-stgcn", "2stream-stgcn", "4stream-fusion"]
+MODEL_ORDER = ["multi-stream-stgcn", "2stream-stgcn", "4stream-fusion", "4stream-late-fusion"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -498,6 +499,31 @@ def run_4stream_fusion(X_joint, X_bone, X_motion, X_bm, y, epochs, device, label
     )
 
 
+def run_4stream_late_fusion(X_joint, X_bone, X_motion, X_bm, y, epochs, device, label_map):
+    """4-stream late fusion ST-GCN."""
+    num_classes = len(np.unique(y))
+
+    def make_model():
+        return FourStreamSTGCN(
+            2, num_classes, GRAPH_ARGS,
+            edge_importance_weighting = True,
+            adaptive_graph            = True,
+            drop_graph_prob           = 0.1,
+            early_fusion              = False,
+            dropout                   = DROPOUT,
+        ).to(device)
+
+    def forward_fn(model, inputs):
+        xj, xm, xb, xbm = inputs
+        return model(xj, motion=xm, bone=xb, bone_motion=xbm)
+
+    return _run_kfold(
+        make_model, forward_fn,
+        FourStreamDataset, (X_joint, X_motion, X_bone, X_bm), y,
+        num_classes, epochs, device, label_map,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # K-FOLD RUNNER  (shared by all models)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -616,12 +642,14 @@ COLORS = {
     "multi-stream-stgcn": "#55A868",
     "2stream-stgcn":      "#C44E52",
     "4stream-fusion":     "#8172B2",
+    "4stream-late-fusion":"#D55E00",
 }
 
 FULL_NAMES = {
     "multi-stream-stgcn": "Multi-Stream ST-GCN\n(3-Stream)",
     "2stream-stgcn":      "Original 2-Stream\nST-GCN (Ported)",
     "4stream-fusion":     "4-Stream Early\nFusion (Current)",
+    "4stream-late-fusion":"4-Stream Late\nFusion",
 }
 
 
@@ -972,6 +1000,7 @@ MODEL_RUNNERS = {
     "multi-stream-stgcn": run_multi_stream_stgcn,
     "2stream-stgcn":      run_2stream_stgcn,
     "4stream-fusion":     run_4stream_fusion,
+    "4stream-late-fusion":run_4stream_late_fusion,
 }
 
 
@@ -1024,8 +1053,10 @@ Examples:
                         help="Run Original 2-Stream ST-GCN (Ported, late fusion)  [alias: --2stream-stgcn]")
     parser.add_argument("--xstream-fusion-4",   action="store_true",
                         help="Run 4-Stream Early Fusion ST-GCN (Current best)     [alias: --4stream-fusion]")
+    parser.add_argument("--xstream-late-fusion-4", action="store_true",
+                        help="Run 4-Stream Late Fusion ST-GCN                     [alias: --4stream-late-fusion]")
     parser.add_argument("--compare-5",           action="store_true",
-                        help="Run all 5 models and produce comparison charts")
+                        help="Run all models and produce comparison charts")
 
     # ── Options ───────────────────────────────────────────────────────────────
     parser.add_argument("--epochs",       type=int,  default=300,
@@ -1057,6 +1088,7 @@ Examples:
         if args.multi_stream_stgcn: selected.append("multi-stream-stgcn")
         if args.xstream_stgcn_2:    selected.append("2stream-stgcn")
         if args.xstream_fusion_4:   selected.append("4stream-fusion")
+        if args.xstream_late_fusion_4: selected.append("4stream-late-fusion")
 
     if not selected:
         parser.print_help()
@@ -1138,7 +1170,8 @@ if __name__ == "__main__":
     _raw_argv = sys.argv[1:]
     sys.argv = [sys.argv[0]] + [
         "--xstream-stgcn-2"    if a == "--2stream-stgcn"   else
-        "--xstream-fusion-4"   if a == "--4stream-fusion"  else a
+        "--xstream-fusion-4"   if a == "--4stream-fusion"  else
+        "--xstream-late-fusion-4" if a == "--4stream-late-fusion" else a
         for a in _raw_argv
     ]
     main()
