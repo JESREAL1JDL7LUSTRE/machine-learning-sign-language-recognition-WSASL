@@ -110,70 +110,99 @@ def global_normalize(X_tr, *others):
     return ((X_tr - mean) / std,) + tuple((X - mean) / std for X in others)
 
 
-def augment_skeleton(x):
-    """Same augmentation pipeline as train.py."""
-    T, F = x.shape
+def augment_streams(*streams):
+    """Synchronously augment multiple streams. The first stream (streams[0])
+    must be the joint positions. Translation is applied ONLY to the joints.
+    Rotation, scaling, and temporal warping are applied identically to all."""
+    xj = streams[0]
+    T, F = xj.shape
     V = F // 2
+    N = len(streams)
 
-    def random_move(seq):
-        angle_c = [-10., -5., 0., 5., 10.]
-        scale_c = [0.9, 1.0, 1.1]
-        trans_c = [-0.2, -0.1, 0., 0.1, 0.2]
-        move_t  = 1
-        node = np.arange(0, T, max(1, int(T / move_t))).round().astype(int)
-        node = np.append(node, T)
-        n    = len(node)
-        A  = np.random.choice(angle_c, n)
-        S  = np.random.choice(scale_c, n)
-        Tx = np.random.choice(trans_c, n)
-        Ty = np.random.choice(trans_c, n)
-        a  = np.zeros(T); s  = np.zeros(T)
-        tx = np.zeros(T); ty = np.zeros(T)
-        for i in range(n - 1):
-            st, ed = node[i], node[i + 1]
-            a[st:ed]  = np.linspace(A[i],  A[i+1],  ed - st) * np.pi / 180
-            s[st:ed]  = np.linspace(S[i],  S[i+1],  ed - st)
-            tx[st:ed] = np.linspace(Tx[i], Tx[i+1], ed - st)
-            ty[st:ed] = np.linspace(Ty[i], Ty[i+1], ed - st)
-        seq2 = seq.copy().reshape(T, V, 2)
-        for i in range(T):
-            ca, sa = np.cos(a[i]) * s[i], np.sin(a[i]) * s[i]
-            rot = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
-            moved = rot @ seq2[i].T
-            moved[0] += tx[i]; moved[1] += ty[i]
-            seq2[i] = moved.T
-        return seq2.reshape(T, F)
+    st = list(streams)
 
     if np.random.rand() < 0.6:
-        x = x + np.random.randn(*x.shape).astype(np.float32) * 0.015
+        for i in range(N):
+            st[i] = st[i] + np.random.randn(*st[i].shape).astype(np.float32) * 0.015
+
     if np.random.rand() < 0.5:
-        x = x * np.random.uniform(0.8, 1.2)
+        scale = np.random.uniform(0.8, 1.2)
+        for i in range(N):
+            st[i] = st[i] * scale
+
     if np.random.rand() < 0.5:
         a = np.random.uniform(-20, 20) * np.pi / 180
         ca, sa = np.cos(a), np.sin(a)
-        xr = x.copy()
-        for i in range(0, F, 2):
-            xr[:, i]   = ca * x[:, i] - sa * x[:, i+1]
-            xr[:, i+1] = sa * x[:, i] + ca * x[:, i+1]
-        x = xr
+        def apply_rot(x):
+            xr = x.copy()
+            for j in range(0, F, 2):
+                xv, yv = x[:, j], x[:, j+1]
+                xr[:, j] = ca*xv - sa*yv
+                xr[:, j+1] = sa*xv + ca*yv
+            return xr
+        for i in range(N):
+            st[i] = apply_rot(st[i])
+
     if np.random.rand() < 0.5:
-        x[:, 0::2] = -x[:, 0::2]
+        for i in range(N):
+            st[i][:, 0::2] = -st[i][:, 0::2]
+
     if np.random.rand() < 0.4:
         mask = np.random.rand(T) > 0.15
-        kept = x[mask]
-        if len(kept) >= 2:
-            x = kept[np.linspace(0, len(kept) - 1, T).astype(int)]
+        if mask.sum() >= 2:
+            idx = np.linspace(0, mask.sum()-1, T).astype(int)
+            for i in range(N):
+                st[i] = st[i][mask][idx]
+
     if np.random.rand() < 0.4:
         warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
-        x = x[np.clip((warp / warp[-1] * (T - 1)).astype(int), 0, T - 1)]
+        idx = np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)
+        for i in range(N):
+            st[i] = st[i][idx]
+
     if np.random.rand() < 0.4:
         cl = int(T * np.random.uniform(0.75, 1.0))
-        st = np.random.randint(0, T - cl + 1)
-        cr = x[st:st + cl]
-        x  = cr[np.linspace(0, len(cr) - 1, T).astype(int)]
+        st_idx = np.random.randint(0, T - cl + 1)
+        idx = np.linspace(0, cl-1, T).astype(int)
+        for i in range(N):
+            st[i] = st[i][st_idx:st_idx+cl][idx]
+
     if np.random.rand() < 0.35:
-        x = random_move(x)
-    return x.astype(np.float32)
+        angle_candidate = [-10.0, -5.0, 0.0, 5.0, 10.0]
+        scale_candidate = [0.9, 1.0, 1.1]
+        trans_candidate = [-0.2, -0.1, 0.0, 0.1, 0.2]
+        move_time = 1
+        node = np.arange(0, T, max(1, int(T / move_time))).round().astype(int)
+        node = np.append(node, T)
+        num_node = len(node)
+
+        A = np.random.choice(angle_candidate, num_node)
+        S = np.random.choice(scale_candidate, num_node)
+        Tx = np.random.choice(trans_candidate, num_node)
+        Ty = np.random.choice(trans_candidate, num_node)
+
+        a_seq = np.zeros(T); s_seq = np.zeros(T)
+        tx_seq = np.zeros(T); ty_seq = np.zeros(T)
+
+        for i in range(num_node - 1):
+            st_n, ed_n = node[i], node[i + 1]
+            a_seq[st_n:ed_n] = np.linspace(A[i], A[i + 1], ed_n - st_n) * np.pi / 180
+            s_seq[st_n:ed_n] = np.linspace(S[i], S[i + 1], ed_n - st_n)
+            tx_seq[st_n:ed_n] = np.linspace(Tx[i], Tx[i + 1], ed_n - st_n)
+            ty_seq[st_n:ed_n] = np.linspace(Ty[i], Ty[i + 1], ed_n - st_n)
+
+        for j in range(N):
+            s2 = st[j].reshape(T, V, 2)
+            for i in range(T):
+                ca, sa = np.cos(a_seq[i]) * s_seq[i], np.sin(a_seq[i]) * s_seq[i]
+                rot = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
+                s2[i] = (rot @ s2[i].T).T
+                if j == 0:
+                    s2[i, :, 0] += tx_seq[i]
+                    s2[i, :, 1] += ty_seq[i]
+            st[j] = s2.reshape(T, F)
+
+    return tuple(x.astype(np.float32) for x in st)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,9 +233,7 @@ class ThreeStreamDataset(Dataset):
     def __getitem__(self, i):
         xj, xb, xm = self.Xj[i].copy(), self.Xb[i].copy(), self.Xm[i].copy()
         if self.augment:
-            xj = augment_skeleton(xj)
-            xb = augment_skeleton(xb)
-            xm = augment_skeleton(xm)
+            xj, xb, xm = augment_streams(xj, xb, xm)
         return (torch.tensor(_to_graph(xj), dtype=torch.float32),
                 torch.tensor(_to_graph(xb), dtype=torch.float32),
                 torch.tensor(_to_graph(xm), dtype=torch.float32),
@@ -226,8 +253,7 @@ class TwoStreamDataset(Dataset):
     def __getitem__(self, i):
         xj, xb = self.Xj[i].copy(), self.Xb[i].copy()
         if self.augment:
-            xj = augment_skeleton(xj)
-            xb = augment_skeleton(xb)
+            xj, xb = augment_streams(xj, xb)
         return (torch.tensor(_to_graph(xj), dtype=torch.float32),
                 torch.tensor(_to_graph(xb), dtype=torch.float32),
                 torch.tensor(self.y[i]))
@@ -249,10 +275,7 @@ class FourStreamDataset(Dataset):
         xj, xm = self.Xj[i].copy(), self.Xm[i].copy()
         xb, xbm = self.Xb[i].copy(), self.Xbm[i].copy()
         if self.augment:
-            xj  = augment_skeleton(xj)
-            xm  = augment_skeleton(xm)
-            xb  = augment_skeleton(xb)
-            xbm = augment_skeleton(xbm)
+            xj, xm, xb, xbm = augment_streams(xj, xm, xb, xbm)
         return (torch.tensor(_to_graph(xj),  dtype=torch.float32),
                 torch.tensor(_to_graph(xm),  dtype=torch.float32),
                 torch.tensor(_to_graph(xb),  dtype=torch.float32),

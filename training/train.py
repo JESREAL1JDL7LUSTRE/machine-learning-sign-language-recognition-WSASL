@@ -131,15 +131,72 @@ def compute_class_weights(y, num_classes, device):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def augment_skeleton(x):
-    T, F = x.shape
+def augment_4streams(xj, xm, xb, xbm):
+    T, F = xj.shape
     V = F // 2
 
-    def random_move(seq):
+    if np.random.rand() < 0.6:
+        xj = xj + np.random.randn(*xj.shape).astype(np.float32) * 0.015
+        xm = xm + np.random.randn(*xm.shape).astype(np.float32) * 0.015
+        xb = xb + np.random.randn(*xb.shape).astype(np.float32) * 0.015
+        xbm = xbm + np.random.randn(*xbm.shape).astype(np.float32) * 0.015
+
+    if np.random.rand() < 0.5:
+        scale = np.random.uniform(0.8, 1.2)
+        xj = xj * scale
+        xm = xm * scale
+        xb = xb * scale
+        xbm = xbm * scale
+
+    if np.random.rand() < 0.5:
+        a = np.random.uniform(-20, 20) * np.pi / 180
+        ca, sa = np.cos(a), np.sin(a)
+        def apply_rot(x):
+            xr = x.copy()
+            for i in range(0, F, 2):
+                xv, yv = x[:, i], x[:, i+1]
+                xr[:, i] = ca*xv - sa*yv
+                xr[:, i+1] = sa*xv + ca*yv
+            return xr
+        xj = apply_rot(xj)
+        xm = apply_rot(xm)
+        xb = apply_rot(xb)
+        xbm = apply_rot(xbm)
+
+    if np.random.rand() < 0.5:
+        xj[:, 0::2] = -xj[:, 0::2]
+        xm[:, 0::2] = -xm[:, 0::2]
+        xb[:, 0::2] = -xb[:, 0::2]
+        xbm[:, 0::2] = -xbm[:, 0::2]
+
+    if np.random.rand() < 0.4:
+        mask = np.random.rand(T) > 0.15
+        if mask.sum() >= 2:
+            idx = np.linspace(0, mask.sum()-1, T).astype(int)
+            xj = xj[mask][idx]
+            xm = xm[mask][idx]
+            xb = xb[mask][idx]
+            xbm = xbm[mask][idx]
+
+    if np.random.rand() < 0.4:
+        warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
+        idx = np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)
+        xj = xj[idx]; xm = xm[idx]
+        xb = xb[idx]; xbm = xbm[idx]
+
+    if np.random.rand() < 0.4:
+        cl = int(T * np.random.uniform(0.75, 1.0))
+        st = np.random.randint(0, T - cl + 1)
+        idx = np.linspace(0, cl-1, T).astype(int)
+        xj = xj[st:st+cl][idx]
+        xm = xm[st:st+cl][idx]
+        xb = xb[st:st+cl][idx]
+        xbm = xbm[st:st+cl][idx]
+
+    if np.random.rand() < 0.35:
         angle_candidate = [-10.0, -5.0, 0.0, 5.0, 10.0]
         scale_candidate = [0.9, 1.0, 1.1]
         trans_candidate = [-0.2, -0.1, 0.0, 0.1, 0.2]
-
         move_time = 1
         node = np.arange(0, T, max(1, int(T / move_time))).round().astype(int)
         node = np.append(node, T)
@@ -150,60 +207,39 @@ def augment_skeleton(x):
         Tx = np.random.choice(trans_candidate, num_node)
         Ty = np.random.choice(trans_candidate, num_node)
 
-        a = np.zeros(T)
-        s = np.zeros(T)
-        t_x = np.zeros(T)
-        t_y = np.zeros(T)
+        a_seq = np.zeros(T); s_seq = np.zeros(T)
+        tx_seq = np.zeros(T); ty_seq = np.zeros(T)
 
         for i in range(num_node - 1):
-            st, ed = node[i], node[i + 1]
-            a[st:ed] = np.linspace(A[i], A[i + 1], ed - st) * np.pi / 180
-            s[st:ed] = np.linspace(S[i], S[i + 1], ed - st)
-            t_x[st:ed] = np.linspace(Tx[i], Tx[i + 1], ed - st)
-            t_y[st:ed] = np.linspace(Ty[i], Ty[i + 1], ed - st)
+            st_n, ed_n = node[i], node[i + 1]
+            a_seq[st_n:ed_n] = np.linspace(A[i], A[i + 1], ed_n - st_n) * np.pi / 180
+            s_seq[st_n:ed_n] = np.linspace(S[i], S[i + 1], ed_n - st_n)
+            tx_seq[st_n:ed_n] = np.linspace(Tx[i], Tx[i + 1], ed_n - st_n)
+            ty_seq[st_n:ed_n] = np.linspace(Ty[i], Ty[i + 1], ed_n - st_n)
 
-        seq2 = seq.copy().reshape(T, V, 2)
+        xj2 = xj.reshape(T, V, 2)
+        xm2 = xm.reshape(T, V, 2)
+        xb2 = xb.reshape(T, V, 2)
+        xbm2 = xbm.reshape(T, V, 2)
+
         for i in range(T):
-            ca, sa = np.cos(a[i]) * s[i], np.sin(a[i]) * s[i]
+            ca, sa = np.cos(a_seq[i]) * s_seq[i], np.sin(a_seq[i]) * s_seq[i]
             rot = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
-            xy = seq2[i].reshape(V, 2).T
-            moved = rot @ xy
-            moved[0] += t_x[i]
-            moved[1] += t_y[i]
-            seq2[i] = moved.T
-        return seq2.reshape(T, F)
 
-    if np.random.rand() < 0.6:
-        x = x + np.random.randn(*x.shape).astype(np.float32) * 0.015
-    if np.random.rand() < 0.5:
-        x = x * np.random.uniform(0.8, 1.2)
-    if np.random.rand() < 0.5:
-        a = np.random.uniform(-20, 20) * np.pi / 180
-        ca, sa = np.cos(a), np.sin(a)
-        xr = x.copy()
-        for i in range(0, F, 2):
-            xv, yv = x[:, i], x[:, i+1]
-            xr[:, i] = ca*xv - sa*yv
-            xr[:, i+1] = sa*xv + ca*yv
-        x = xr
-    if np.random.rand() < 0.5:
-        x[:, 0::2] = -x[:, 0::2]
-    if np.random.rand() < 0.4:
-        mask = np.random.rand(T) > 0.15
-        kept = x[mask]
-        if len(kept) >= 2:
-            x = kept[np.linspace(0, len(kept)-1, T).astype(int)]
-    if np.random.rand() < 0.4:
-        warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
-        x = x[np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)]
-    if np.random.rand() < 0.4:
-        cl = int(T * np.random.uniform(0.75, 1.0))
-        st = np.random.randint(0, T - cl + 1)
-        cr = x[st:st+cl]
-        x = cr[np.linspace(0, len(cr)-1, T).astype(int)]
-    if np.random.rand() < 0.35:
-        x = random_move(x)
-    return x.astype(np.float32)
+            xj2[i] = (rot @ xj2[i].T).T
+            xj2[i, :, 0] += tx_seq[i]
+            xj2[i, :, 1] += ty_seq[i]
+
+            xm2[i] = (rot @ xm2[i].T).T
+            xb2[i] = (rot @ xb2[i].T).T
+            xbm2[i] = (rot @ xbm2[i].T).T
+
+        xj = xj2.reshape(T, F)
+        xm = xm2.reshape(T, F)
+        xb = xb2.reshape(T, F)
+        xbm = xbm2.reshape(T, F)
+
+    return xj.astype(np.float32), xm.astype(np.float32), xb.astype(np.float32), xbm.astype(np.float32)
 
 
 class FourStreamDataset(Dataset):
@@ -252,11 +288,7 @@ class FourStreamDataset(Dataset):
         xb = self.X_bone[idx].copy()
         xbm = self.X_bm[idx].copy()
         if self.augment:
-            # Apply same augmentation independently to all four streams
-            xj = augment_skeleton(xj)
-            xmj = augment_skeleton(xmj)
-            xb = augment_skeleton(xb)
-            xbm = augment_skeleton(xbm)
+            xj, xmj, xb, xbm = augment_4streams(xj, xmj, xb, xbm)
         # Convert all streams to (2, T, V) graph tensors
         return (torch.tensor(self.to_graph(xj),  dtype=torch.float32),
                 torch.tensor(self.to_graph(xmj), dtype=torch.float32),
