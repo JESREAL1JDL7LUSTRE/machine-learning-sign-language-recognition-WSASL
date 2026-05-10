@@ -142,7 +142,7 @@ Two main entry points:
 **Key sections in `main.py`:**
 - Dataset classes for 2/3/4 streams.
 - Training engine (`train_one_fold` + `_run_kfold`).
-- Model runners (`run_multi_stream_stgcn`, `run_2stream_stgcn`, `run_4stream_fusion`).
+- Model runners (`run_multi_stream_stgcn`, `run_4stream_late_fusion`, `run_4stream_fusion`).
 - Chart creation (`plot_model_results`, `plot_comparison_overview`).
 
 ### Step F) Evaluate or run inference
@@ -178,13 +178,12 @@ A simpler, custom 3-stream ST-GCN with its own fixed adjacency.
 Each stream is independent and their logits are summed.
 
 ### `models/stgcn_2stream_ported.py`
-A port of the original two-stream ST-GCN. It runs joint and bone streams and sums their logits.
+A legacy port of the original two-stream ST-GCN. It runs joint and bone streams and sums their logits.
 
 ### `models/st_gcn_twostream.py`
-The four-stream fusion model. It can do:
-- **Early fusion:** concatenate features then classify.
-- **Late fusion:** sum logits.
-Early fusion is the default.
+The four-stream model architecture. It supports two modes:
+- **Late fusion:** Runs 4 streams independently and sums the final logits (the `4stream-late-fusion` model).
+- **Early fusion:** Concatenates 128-dimensional features from 4 streams before a shared dense classifier (the `4stream-fusion` model).
 
 ### `models/lstm.py`
 Despite the name, this is a TCN + attention model used for an older baseline. It does:
@@ -203,6 +202,6 @@ Despite the name, this is a TCN + attention model used for an older baseline. It
 
 ## 7) What to read next
 If you want a very detailed, line-by-line explanation of each model, use:
-- `docs/2stream_stgcn_walkthrough.md`
-- `docs/4stream_fusion_walkthrough.md`
 - `docs/multi_stream_stgcn_walkthrough.md`
+- `docs/4stream_late_fusion_walkthrough.md`
+- `docs/4stream_fusion_walkthrough.md`

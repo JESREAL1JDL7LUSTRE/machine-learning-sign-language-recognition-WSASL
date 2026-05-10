@@ -44,16 +44,14 @@
 **Architecture:** ST-GCN (Spatial-Temporal Graph Convolutional Network)
 - Graph convolution: aggregates info from neighboring joints via adjacency matrix
 - Temporal convolution: captures motion across frames (kernel = 9 frames)
-- 6 blocks: 2→64→64→128→128→256→256 channels
-- Global Average Pool → Linear classifier
 
 **3 Models compared:**
 
 | # | Model | Streams | Fusion |
 |---|-------|---------|--------|
-| 1 | Three-Stream ST-GCN | Joint + Bone + Motion | Late (sum logits) |
-| 2 | Two-Stream ST-GCN | Joint + Bone | Late (sum logits) |
-| 3 | **Four-Stream Early Fusion** | Joint+Motion+Bone+BoneMotion | **Early (concat features)** |
+| 1 | Multi-Stream ST-GCN | Joint + Bone + Motion | Late (sum logits) |
+| 2 | Four-Stream Late Fusion | Joint + Motion + Bone + BoneMotion | Late (sum logits) |
+| 3 | **Four-Stream Early Fusion** | Joint + Motion + Bone + BoneMotion | **Early (concat features)** |
 
 **Training tricks:** AdamW, warmup-cosine LR, SWA from ep50, label smoothing, class weights, early stopping
 
@@ -64,14 +62,14 @@
 
 | Model | CV Accuracy | Test Accuracy |
 |-------|-------------|---------------|
-| Three-Stream (late) | 5.11% ± 0.48% | 1.30% |
-| Two-Stream (late) | 5.11% ± 0.48% | 1.30% |
+| Multi-Stream (late) | 5.11% ± 0.48% | 1.30% |
+| Four-Stream (late) | 5.57% ± 0.69% | 1.30% |
 | **Four-Stream (early)** | **5.34% ± 0.41%** | **3.90%** |
 | Random chance baseline | — | **2.00%** |
 
-**Key finding:** 4-stream early fusion is 3× better than late fusion on test set
+**Key finding:** 4-stream early fusion is ~3× better than late fusion on the test set.
 
-**Why low accuracy?** Only ~10 samples per class — state-of-the-art needs 50+ per class
+**Why low accuracy?** Only ~10 samples per class — state-of-the-art requires 50+ samples per class.
 
 ---
 
@@ -95,7 +93,6 @@ Video → MediaPipe → normalize → 64-frame resample → 4 streams → ST-GCN
 - **4 input streams** (joint, bone, motion, bone motion)
 - **Best test accuracy: 3.90%** (vs. 2.0% random chance)
 - **Random chance baseline: 2.0%** (1/50 classes)
-- **Training time:** ~47 minutes per model run
 
 ---
 
@@ -105,15 +102,14 @@ Video → MediaPipe → normalize → 64-frame resample → 4 streams → ST-GCN
 | Extraction | `preprocessing/extract.py` | Lines 192–266 (extract_mp function) |
 | Normalization | `preprocessing/normalize.py` | Lines 337–379 (normalize_skeleton) |
 | Bone/Motion | `preprocessing/normalize.py` | Lines 437–484 (compute_bone_vectors, compute_motion) |
-| Model | `models/stgcn.py` | Lines 236–311 (STGCNStream class) |
-| Four-stream | `models/st_gcn_twostream.py` | Lines 40–181 (full Model class) |
+| Model (Early) | `models/st_gcn_twostream.py` | Lines 40–181 (full Model class) |
 | Training | `training/train.py` | Lines 328–438 (train_fold function) |
 | Evaluation | `evaluation/evaluate.py` | Lines 76–124 (predict_video function) |
 
 ---
 
 ## Charts Available (output/charts/)
-- `multi_stream_stgcn_results.png` — 3-stream results
-- `2stream_stgcn_results.png` — 2-stream results
-- `4stream_fusion_results.png` — 4-stream results (BEST)
+- `multi_stream_stgcn_results.png`
+- `4stream_late_fusion_results.png`
+- `4stream_fusion_results.png` (BEST)
 - `comparison_overview.png` — All models side-by-side
