@@ -967,7 +967,7 @@ def plot_comparison_overview(all_results, save_path):
             cell.set_facecolor("#FFFFFF")
     ax5.set_title("Results Summary Table", fontweight="bold", pad=12)
 
-    fig.suptitle("ASL Sign Language Recognition — 5-Model Comparison Overview",
+    fig.suptitle(f"ASL Sign Language Recognition — {len(keys)}-Model Comparison Overview",
                  fontsize=15, fontweight="bold", y=0.99)
 
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
