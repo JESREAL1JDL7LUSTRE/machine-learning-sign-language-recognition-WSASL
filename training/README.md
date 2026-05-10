@@ -1,3 +1,5 @@
+[← Back to Main README](../README.md)
+
 # training/
 
 This directory contains the **training pipeline** for the four-stream ST-GCN sign language recognition model. It includes the dataset loader with augmentations, the full training loop with k-fold cross-validation, SWA, and early stopping.

@@ -10,13 +10,16 @@ A skeleton-based isolated sign language recognition system using **Spatial-Tempo
 .
 ├── main.py                  # Multi-model comparison runner + chart generation
 ├── preprocessing/           # Video → skeleton keypoint pipeline
+│   ├── README.md            # Preprocessing module documentation
 │   ├── extract.py           # Step 1: Extract keypoints (MediaPipe or YOLO)
 │   ├── normalize.py         # Step 2: Normalize + compute bone/motion streams
 │   └── resample.py          # Step 3: Resample all streams to 64 frames
 ├── training/                # Model training
+│   ├── README.md            # Training pipeline documentation
 │   ├── dataset.py           # Dataset class + data augmentation
 │   └── train.py             # Four-stream ST-GCN training loop
 ├── models/                  # Neural network architectures
+│   ├── README.md            # Models & architecture documentation
 │   ├── graph.py             # Skeleton graph, adaptive adjacency, DropGraph
 │   ├── tgcn.py              # Core graph convolution (ConvTemporalGraphical)
 │   ├── st_gcn.py            # Single-stream ST-GCN backbone
@@ -25,6 +28,7 @@ A skeleton-based isolated sign language recognition system using **Spatial-Tempo
 │   ├── st_gcn_twostream.py  # Four-stream ST-GCN with early/late fusion
 │   └── stgcn_2stream_ported.py  # Two-stream ST-GCN port
 ├── evaluation/              # Evaluation and inference
+│   ├── README.md            # Evaluation module documentation
 │   └── evaluate.py          # Classification report + single-video inference
 ├── docs/                    # Architecture documentation
 ├── dataset/                 # Input videos organized by class folder
@@ -161,7 +165,19 @@ Charts are saved to `output/charts/`. Results are cached in `output/model_result
 
 ---
 
-## Docs
+## Documentation
+
+We provide extensive documentation for both the project components and the model architectures.
+
+### Component Documentation
+
+Each major module contains its own `README.md` detailing its implementation and usage:
+- [**Models** (`models/README.md`)](models/README.md) - Neural network architectures, graph formulations, and fusion strategies.
+- [**Preprocessing** (`preprocessing/README.md`)](preprocessing/README.md) - Video extraction, normalization, and stream generation.
+- [**Training** (`training/README.md`)](training/README.md) - Dataset handling, augmentations, and training loops.
+- [**Evaluation** (`evaluation/README.md`)](evaluation/README.md) - Inference scripts, metrics, and visualization.
+
+### Architecture Walkthroughs
 
 See `docs/` for detailed architecture walkthroughs:
 
@@ -172,4 +188,5 @@ See `docs/` for detailed architecture walkthroughs:
 | `4stream_fusion.md` | Four-stream early fusion architecture |
 | `4stream_fusion_walkthrough.md` | Four-stream training walkthrough |
 | `multi_stream_stgcn.md` | Three-stream ST-GCN architecture |
+| `multi_stream_stgcn_walkthrough.md` | Three-stream training walkthrough |
 | `project_walkthrough_beginner.md` | Full project walkthrough for beginners |

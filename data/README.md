@@ -1,10 +1,13 @@
-# Data Directory
+[← Back to Main README](../README.md)
+
+# data/
+
+This directory is used as a local cache for pre-trained model weights downloaded by the extraction backends.
 
 ## Structure
-- raw/        → original dataset (videos)
-- processed/  → extracted features (frames/keypoints)
-- splits/     → train/test split files
+- `*.task` → MediaPipe model weights (e.g., `pose_landmarker_heavy.task`, `hand_landmarker.task`).
+- `*.pt` → YOLO model weights (e.g., `yolov8n-pose.pt`).
 
 ## Notes
-- Do NOT modify raw data
-- Keep processed data separate for reproducibility
+- These files are automatically downloaded by `preprocessing/extract.py` when running for the first time.
+- They are generally ignored by Git to save repository space.
