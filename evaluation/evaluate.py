@@ -5,137 +5,187 @@ evaluate.py — Model Evaluation and Single-Video Inference
 Two modes of operation:
 
 1. Dataset evaluation (default, no arguments):
-   Loads the pre-processed dataset from output/, runs the trained SignLSTM
-   (TCN+Attention) model over all samples, and prints a full sklearn
-   classification_report plus a confusion matrix.
+   Loads the pre-processed dataset from output/, runs the selected model
+   over all samples, and prints a full sklearn classification_report plus
+   a confusion matrix.
 
 2. Single-video inference (--video <path>):
    Takes one raw video file, runs the complete preprocessing pipeline
-   (extract → clean → normalize → resample), and prints the predicted class.
+   (extract → clean → filter → normalize → smooth → resample → engineer streams),
+   and prints the predicted class.
 
 Usage:
-    python evaluation/evaluate.py                        # dataset eval
-    python evaluation/evaluate.py --video clip.mp4       # single video
+    # Dataset eval (defaults to 4stream-early)
+    python evaluation/evaluate.py
+    
+    # Dataset eval with specific model
+    python evaluation/evaluate.py --model 3stream
+    
+    # Single video inference
+    python evaluation/evaluate.py --video clip.mp4 --model 4stream-early
 """
 
 import os
 import sys
 import json
+import argparse
 import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix
+from torch.utils.data import Dataset, DataLoader
 
 # ── Path setup: add project root so we can import sibling packages ─────────────
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-# Model and preprocessing imports
-from models.lstm      import SignLSTM
-from training.dataset import SignDataset
-from preprocessing.extract    import extract_skeleton
-from preprocessing.normalize  import normalize_skeleton, clean_missing_keypoints
+# Model imports
+from models.lstm              import SignLSTM
+from models.stgcn             import STGCN, NUM_JOINTS
+from models.st_gcn_twostream  import Model as FourStreamSTGCN
+
+# Preprocessing imports
+from preprocessing.extract    import extract_mp, make_mp_detectors, download_mp_models
+from preprocessing.normalize  import (normalize_skeleton, clean_missing_keypoints,
+                                      filter_joints, normalize_dataset,
+                                      smooth_dataset, compute_bone_vectors,
+                                      compute_motion)
 from preprocessing.resample   import temporal_resample
 
 # ── Global settings ────────────────────────────────────────────────────────────
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = os.path.join(ROOT, "models", "sign_lstm.pth")   # trained TCN weights
 OUTPUT_DIR = os.path.join(ROOT, "output")
 TARGET_LEN = 64   # frames per sequence (must match training config)
 
 
+# ── Graph Helper ──────────────────────────────────────────────────────────────
+def _to_graph(x):
+    """Reshape (T, F) → (2, T, V) for ST-GCN."""
+    T, F = x.shape
+    V = F // 2
+    return x.reshape(T, V, 2).transpose(2, 0, 1).astype(np.float32)
+
+
+# ── Dataset Classes ───────────────────────────────────────────────────────────
+class LSTMDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.int64)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i):
+        return torch.tensor(self.X[i]), torch.tensor(self.y[i])
+
+class ThreeStreamDataset(Dataset):
+    def __init__(self, Xj, Xb, Xm, y):
+        self.Xj = Xj.astype(np.float32)
+        self.Xb = Xb.astype(np.float32)
+        self.Xm = Xm.astype(np.float32)
+        self.y  = y.astype(np.int64)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i):
+        return (torch.tensor(_to_graph(self.Xj[i])),
+                torch.tensor(_to_graph(self.Xb[i])),
+                torch.tensor(_to_graph(self.Xm[i])),
+                torch.tensor(self.y[i]))
+
+class FourStreamDataset(Dataset):
+    def __init__(self, Xj, Xm, Xb, Xbm, y):
+        self.Xj  = Xj.astype(np.float32)
+        self.Xm  = Xm.astype(np.float32)
+        self.Xb  = Xb.astype(np.float32)
+        self.Xbm = Xbm.astype(np.float32)
+        self.y   = y.astype(np.int64)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i):
+        return (torch.tensor(_to_graph(self.Xj[i])),
+                torch.tensor(_to_graph(self.Xm[i])),
+                torch.tensor(_to_graph(self.Xb[i])),
+                torch.tensor(_to_graph(self.Xbm[i])),
+                torch.tensor(self.y[i]))
+
+
 # ── Load model ────────────────────────────────────────────────────────────────
-def load_model(num_classes):
-    """Instantiate SignLSTM and load pre-trained weights.
+def load_model(num_classes, model_type):
+    """Instantiate the selected model and load pre-trained weights."""
+    print(f"\nLoading model: {model_type}")
+    if model_type == "lstm":
+        model = SignLSTM(150, 128, 2, num_classes, 0.3, True).to(DEVICE)
+        model_path = os.path.join(ROOT, "models", "sign_lstm.pth")
+    elif model_type == "3stream":
+        model = STGCN(num_classes=num_classes).to(DEVICE)
+        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+    elif model_type == "4stream-late":
+        model = FourStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"}, early_fusion=False).to(DEVICE)
+        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+    elif model_type == "4stream-early":
+        model = FourStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"}, early_fusion=True).to(DEVICE)
+        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
-    Builds the same TCN+Attention architecture that was saved during training,
-    loads the state dict from MODEL_PATH, and switches to eval mode (disables
-    dropout, uses running BN stats).
-
-    Args:
-        num_classes (int): Number of sign classes (from label_map.json).
-
-    Returns:
-        SignLSTM: Model on DEVICE, ready for inference.
-    """
-    model = SignLSTM(
-        input_size   = 150,          # raw MediaPipe feature size
-        hidden_size  = 128,
-        num_layers   = 2,
-        num_classes  = num_classes,
-        dropout      = 0.3,
-        bidirectional= True          # API-compat flag (TCN is not bidirectional)
-    ).to(DEVICE)
-
-    # Load saved weights; map_location handles loading GPU weights on CPU
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.eval()   # disable dropout and switch BN to inference mode
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        print(f"✅ Loaded weights from {model_path}")
+    else:
+        print(f"⚠️  Warning: Weights not found at {model_path}. Using random weights.")
+    
+    model.eval()
     return model
 
 
 # ── Single video prediction ───────────────────────────────────────────────────
-def predict_video(video_path, model, label_map):
-    """Run the full preprocessing + inference pipeline on a single video.
-
-    Processes raw video → keypoints → normalization → fixed-length tensor
-    → forward pass → predicted class name.
-
-    Pipeline:
-        extract_skeleton      — MediaPipe frame-by-frame keypoint extraction
-        clean_missing_keypoints — per-joint temporal interpolation of zeros
-        normalize_skeleton    — center (mid-shoulder) + scale (shoulder width)
-                                + relative hand re-anchoring
-        temporal_resample     — linear interpolation to TARGET_LEN frames
-        unsqueeze(0)          — add batch dimension
-        model.forward()       — TCN + Attention forward pass
-        argmax                — pick highest-scoring class
-
-    Args:
-        video_path (str) : Path to raw video file (.mp4 / .avi / .mov).
-        model            : Loaded SignLSTM model in eval mode.
-        label_map  (dict): {class_name: class_index} mapping.
-
-    Returns:
-        str: Predicted class name, or "unknown(<idx>)" if idx not in map.
-    """
-    # Build reverse mapping: index → class name for human-readable output
+def predict_video(video_path, model, model_type, label_map):
+    """Run the full preprocessing + inference pipeline on a single video."""
     idx_to_label = {v: k for k, v in label_map.items()}
 
-    # Step 1: Extract raw skeleton keypoints from the video
-    skeleton = extract_skeleton(video_path, max_frames=TARGET_LEN)
+    print("\nExtracting skeleton...")
+    download_mp_models()
+    pose_det, hand_det = make_mp_detectors()
+    skeleton = extract_mp(video_path, pose_det, hand_det, max_frames=TARGET_LEN)
+    pose_det.close()
+    hand_det.close()
 
-    # Step 2: Fill missing (zero) keypoints via per-joint interpolation
+    print("Preprocessing and feature engineering...")
     skeleton = clean_missing_keypoints(skeleton)
 
-    # Step 3: Center, scale, and re-anchor hand features
-    skeleton = normalize_skeleton(skeleton)
-
-    # Step 4: Resample to exactly TARGET_LEN frames via linear interpolation
-    skeleton = temporal_resample(skeleton, target_len=TARGET_LEN)
-
-    # Step 5: Convert to float32 tensor and add batch dimension
-    # Shape: (1, TARGET_LEN, 150) — batch of one sample
-    tensor = torch.tensor(skeleton, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-
-    # Step 6: Forward pass (no_grad = no gradient tracking, faster + less memory)
-    with torch.no_grad():
-        output = model(tensor)              # → (1, num_classes) logits
-        pred_idx = output.argmax(dim=1).item()  # index of highest logit
-
+    if model_type == "lstm":
+        skeleton = normalize_skeleton(skeleton)
+        skeleton = temporal_resample(skeleton, target_len=TARGET_LEN)
+        tensor = torch.tensor(skeleton, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = model(tensor)
+    else:
+        # ST-GCN pipeline
+        skel_batch = np.expand_dims(skeleton, 0)
+        skel_filt  = filter_joints(skel_batch)
+        skel_norm  = normalize_dataset(skel_filt)
+        skel_smooth = smooth_dataset(skel_norm)
+        
+        X_joint_resampled = temporal_resample(skel_smooth[0], target_len=TARGET_LEN)
+        X_joint = np.expand_dims(X_joint_resampled, 0)
+        
+        X_bones  = compute_bone_vectors(X_joint)
+        X_motion = compute_motion(X_joint)
+        X_bm     = compute_motion(X_bones)
+        
+        t_joint  = torch.tensor(_to_graph(X_joint[0])).unsqueeze(0).to(DEVICE)
+        t_bone   = torch.tensor(_to_graph(X_bones[0])).unsqueeze(0).to(DEVICE)
+        t_motion = torch.tensor(_to_graph(X_motion[0])).unsqueeze(0).to(DEVICE)
+        t_bm     = torch.tensor(_to_graph(X_bm[0])).unsqueeze(0).to(DEVICE)
+        
+        with torch.no_grad():
+            if model_type == "3stream":
+                inputs = {"joint": t_joint, "bone": t_bone, "motion": t_motion}
+                output = model(inputs)
+            else:
+                output = model(t_joint, motion=t_motion, bone=t_bone, bone_motion=t_bm)
+                
+    pred_idx = output.argmax(dim=1).item()
     return idx_to_label.get(pred_idx, f"unknown({pred_idx})")
 
 
 # ── Evaluate on saved dataset ─────────────────────────────────────────────────
-def evaluate_dataset():
-    """Load saved dataset and print classification report + confusion matrix.
-
-    Loads whichever processed dataset file is available (priority: X_final >
-    X_normalized > X_raw), then runs the model in batch mode over all samples.
-
-    Output:
-        - sklearn classification_report: per-class precision, recall, F1, support
-        - confusion matrix (raw counts)
-    """
-    # ── Load label map ────────────────────────────────────────────────────────
+def evaluate_dataset(model_type):
+    """Load saved dataset and print classification report + confusion matrix."""
     label_map_path = os.path.join(OUTPUT_DIR, "label_map.json")
     if not os.path.exists(label_map_path):
         print("❌ label_map.json not found. Run extract.py first.")
@@ -147,44 +197,78 @@ def evaluate_dataset():
     num_classes  = len(label_map)
     idx_to_label = {v: k for k, v in label_map.items()}
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    model = load_model(num_classes)
+    model = load_model(num_classes, model_type)
 
-    # ── Load data (try best available file in priority order) ─────────────────
-    # X_final.npy is the final post-resample file from the full pipeline;
-    # fall back to earlier pipeline outputs if the later ones don't exist yet.
-    for fname in ["X_final.npy", "X_normalized.npy", "X_raw.npy"]:
-        path = os.path.join(OUTPUT_DIR, fname)
-        if os.path.exists(path):
-            X = np.load(path)
-            break
-    else:
-        print("❌ No processed data found. Run preprocessing scripts first.")
+    print("\nLoading dataset streams...")
+    y_path = os.path.join(OUTPUT_DIR, "y.npy")
+    if not os.path.exists(y_path):
+        print("❌ Dataset not found in output directory.")
         return
+    y = np.load(y_path)
 
-    # Load integer class labels
-    y = np.load(os.path.join(OUTPUT_DIR, "y.npy"))
+    if model_type == "lstm":
+        # LSTM uses 150-d features
+        for fname in ["X_final.npy", "X_normalized.npy", "X_raw.npy"]:
+            path = os.path.join(OUTPUT_DIR, fname)
+            if os.path.exists(path):
+                X = np.load(path)
+                break
+        else:
+            print("❌ No processed data found.")
+            return
+        dataset = LSTMDataset(X, y)
+        
+        def forward_fn(m, batch):
+            x, _ = batch
+            return m(x.to(DEVICE))
+            
+    else:
+        # ST-GCN uses 102-d features split into streams
+        try:
+            X_j  = np.load(os.path.join(OUTPUT_DIR, "X_normalized.npy"))
+            X_b  = np.load(os.path.join(OUTPUT_DIR, "X_bones.npy"))
+            X_m  = np.load(os.path.join(OUTPUT_DIR, "X_motion.npy"))
+            X_bm = np.load(os.path.join(OUTPUT_DIR, "X_bone_motion.npy"))
+        except FileNotFoundError as e:
+            print(f"❌ Missing stream data: {e}. Run normalize.py first.")
+            return
+            
+        # Apply global z-score normalization (required for ST-GCN models)
+        def z_score(arr):
+            mean = arr.mean(axis=(0, 1), keepdims=True)
+            std  = arr.std(axis=(0, 1), keepdims=True)
+            std  = np.where(std < 1e-6, 1.0, std)
+            return (arr - mean) / std
 
-    # ── Build DataLoader ──────────────────────────────────────────────────────
-    # augment=False: deterministic inference (no augmentation during evaluation)
-    dataset    = SignDataset(X, y, augment=False)
-    from torch.utils.data import DataLoader
-    loader     = DataLoader(dataset, batch_size=16, shuffle=False)
+        X_j  = z_score(X_j)
+        X_b  = z_score(X_b)
+        X_m  = z_score(X_m)
+        X_bm = z_score(X_bm)
 
-    # ── Run inference over all batches ────────────────────────────────────────
+        if model_type == "3stream":
+            dataset = ThreeStreamDataset(X_j, X_b, X_m, y)
+            def forward_fn(m, batch):
+                xj, xb, xm, _ = batch
+                return m({"joint": xj.to(DEVICE), "bone": xb.to(DEVICE), "motion": xm.to(DEVICE)})
+        else:
+            dataset = FourStreamDataset(X_j, X_m, X_b, X_bm, y)
+            def forward_fn(m, batch):
+                xj, xm, xb, xbm, _ = batch
+                return m(xj.to(DEVICE), motion=xm.to(DEVICE), bone=xb.to(DEVICE), bone_motion=xbm.to(DEVICE))
+
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+
+    print("\nRunning inference...")
     all_preds  = []
     all_labels = []
 
     with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(DEVICE)
-            output  = model(X_batch)                       # → (batch, num_classes)
-            preds   = output.argmax(dim=1).cpu().numpy()   # predicted class indices
+        for batch in loader:
+            output = forward_fn(model, batch)
+            preds  = output.argmax(dim=1).cpu().numpy()
             all_preds.extend(preds)
-            all_labels.extend(y_batch.numpy())
+            all_labels.extend(batch[-1].numpy())
 
-    # ── Print results ─────────────────────────────────────────────────────────
-    # Build human-readable class names in label index order
     target_names = [idx_to_label[i] for i in range(num_classes)]
 
     print("\n── Classification Report ──────────────────────────────")
@@ -197,23 +281,23 @@ def evaluate_dataset():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Evaluate or run inference on sign language model")
+    parser = argparse.ArgumentParser(description="Evaluate or run inference on sign language models")
     parser.add_argument("--video", type=str, default=None,
                         help="Path to a single video for inference")
+    parser.add_argument("--model", type=str, default="4stream-early",
+                        choices=["lstm", "3stream", "4stream-late", "4stream-early"],
+                        help="Model architecture to use (default: 4stream-early)")
     args = parser.parse_args()
 
     if args.video:
-        # Single-video inference mode
         label_map_path = os.path.join(OUTPUT_DIR, "label_map.json")
         with open(label_map_path) as f:
             label_map = json.load(f)
 
-        model = load_model(len(label_map))
-        result = predict_video(args.video, model, label_map)
-        print(f"\nPredicted class: {result}")
+        model = load_model(len(label_map), args.model)
+        result = predict_video(args.video, model, args.model, label_map)
+        print(f"\n====================================")
+        print(f" Predicted class: {result}")
+        print(f"====================================")
     else:
-        # Full dataset evaluation mode
-        evaluate_dataset()
+        evaluate_dataset(args.model)

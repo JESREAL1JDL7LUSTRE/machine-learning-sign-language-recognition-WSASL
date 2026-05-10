@@ -81,3 +81,5 @@ Remove-Item output\model_results.json
 del output\model_results.json
 ```
 ```
+
+.venv\Scripts\python.exe evaluation\evaluate.py --model 3stream; .venv\Scripts\python.exe evaluation\evaluate.py --model 4stream-late; .venv\Scripts\python.exe evaluation\evaluate.py --model 4stream-early
