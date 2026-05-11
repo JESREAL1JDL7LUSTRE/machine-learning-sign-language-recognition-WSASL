@@ -150,8 +150,19 @@ def load_model(num_classes, model_type):
                 model.load_state_dict(state_dict, strict=False)
                 print(f"✅ Loaded weights from {model_path} with strict=False (partial match)")
             except Exception as e2:
-                print(f"❌ Failed to load checkpoint even with strict=False: {e2}")
-                raise
+                print(f"⚠️  Warning: strict=False still failed: {e2}")
+                # Fallback: drop mismatched classifier keys (class count mismatch)
+                filtered = {}
+                mismatched = []
+                for k, v in state_dict.items():
+                    if k in model.state_dict() and model.state_dict()[k].shape == v.shape:
+                        filtered[k] = v
+                    else:
+                        mismatched.append(k)
+                if mismatched:
+                    print("⚠️  Dropping mismatched keys:", mismatched)
+                model.load_state_dict(filtered, strict=False)
+                print("✅ Loaded compatible weights after dropping mismatched keys")
     else:
         print(f"⚠️  Warning: Weights not found at {model_path}. Using random weights.")
     

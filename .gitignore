@@ -4,3 +4,8 @@ dataset
 models\sign_stgcn.pth
 models\sign_lstm.pth
 output\*.npy
+
+.venv*/
+venv*/
+__pycache__/
+*.py[cod]
