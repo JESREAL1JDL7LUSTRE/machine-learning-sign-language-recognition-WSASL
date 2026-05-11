@@ -12,6 +12,7 @@ import streamlit as st
 import os
 import sys
 import json
+import subprocess
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
@@ -216,3 +217,56 @@ if run_btn:
 
 st.markdown("---")
 st.caption("This demo runs the full pipeline locally. For faster real-time demos, consider exporting a lightweight pose detector or running on a machine with CUDA and switching to the YOLO backend.")
+
+
+def _run_evaluation_script(model_name: str) -> None:
+    """Run `evaluation/evaluate.py --model <model_name>` and stream output to the app."""
+    status.info(f"Running evaluation for {model_name}...")
+    log_placeholder = st.empty()
+    out_lines = []
+    eval_script = os.path.join(ROOT, "evaluation", "evaluate.py")
+    cmd = [sys.executable, eval_script, "--model", model_name]
+    try:
+        env = os.environ.copy()
+        # Ensure subprocess prints UTF-8 so emojis and warnings don't raise on Windows console
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+    except Exception as e:
+        status.error(f"Failed to start evaluation: {e}")
+        return
+
+    try:
+        # Stream lines as they arrive
+        for line in proc.stdout:
+            out_lines.append(line)
+            # keep viewport limited to last ~200 lines to avoid huge memory
+            display_text = "".join(out_lines[-200:])
+            log_placeholder.code(display_text)
+        ret = proc.wait()
+        if ret == 0:
+            status.success(f"Evaluation finished ({model_name}).")
+        else:
+            status.error(f"Evaluation exited with code {ret}.")
+    except Exception as e:
+        status.error(f"Error while running evaluation: {e}")
+
+
+st.markdown("**Run evaluation script**")
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    if st.button("Eval: 3stream"):
+        _run_evaluation_script("3stream")
+with col_b:
+    if st.button("Eval: 4stream-early"):
+        _run_evaluation_script("4stream-early")
+with col_c:
+    if st.button("Eval: 4stream-late"):
+        _run_evaluation_script("4stream-late")
