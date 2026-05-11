@@ -206,7 +206,7 @@ Each major module contains its own `README.md` detailing its implementation and 
 
 ### GUI Demo
 
-We provide a simple Streamlit GUI for running single-video inference, dataset-video inference, or dataset-sample inference.
+We provide a simple Streamlit GUI for comparing trained ST-GCN variants on preprocessed dataset samples.
 
 - [**GUI Guide** (`docs/gui.md`)](docs/gui.md) — how to run the GUI and required inputs.
 
