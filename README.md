@@ -163,6 +163,31 @@ python main.py --compare-5 --epochs 100    # shorter run
 
 Charts are saved to `output/charts/`. Results are cached in `output/model_results.json`.
 
+## Generating Charts From Cached Results
+
+If you already have per-model JSON result files in `output/` (for example after running `main.py` or training scripts), you can generate the same per-model 4-panel charts and the comparison overview using the lightweight script at `evaluation/generate_charts.py`.
+
+Required JSON files (place in `output/`):
+
+- `results_3stream.json` — Multi-stream ST-GCN (3-stream)
+- `results_4stream_early.json` — 4-stream early fusion
+- `results_4stream_late.json` — 4-stream late fusion
+
+Run:
+
+```bash
+python evaluation/generate_charts.py
+```
+
+Output (saved to `output/charts/`):
+
+- `multi_stream_stgcn_results.png`
+- `4stream_fusion_results.png`
+- `4stream_late_fusion_results.png`
+- `comparison_overview.png`
+
+The script will also produce per-model confusion matrix PNGs and training-history PNGs if the JSON files include the required arrays (`all_preds`, `all_labels`, and `fold_histories`).
+
 ---
 
 ## Documentation

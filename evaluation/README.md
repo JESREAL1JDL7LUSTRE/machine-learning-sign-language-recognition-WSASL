@@ -1,3 +1,55 @@
+evaluation/generate_charts.py — Generate model charts from JSON results
+===============================================================
+
+Purpose
+-------
+Create per-model 4-panel result figures and a comparison overview using cached JSON result files.
+
+When to use
+-----------
+- You have already run training or `main.py` and produced per-model result JSON files in `output/`.
+- You want to regenerate charts without re-running training.
+
+Required JSON files (place in `output/`)
+--------------------------------------
+- `results_3stream.json` — Multi-stream ST-GCN (3-stream)
+- `results_4stream_early.json` — 4-stream early fusion
+- `results_4stream_late.json` — 4-stream late fusion
+
+What the script produces
+------------------------
+The script reads the JSON files from `output/` and writes charts to `output/charts/`:
+
+- `multi_stream_stgcn_results.png` — 4-panel model figure for multi-stream ST-GCN
+- `4stream_fusion_results.png` — 4-panel model figure for 4-stream early fusion
+- `4stream_late_fusion_results.png` — 4-panel model figure for 4-stream late fusion
+- `comparison_overview.png` — overall comparison figure (test/CV vs published)
+
+It will also output per-model confusion matrices (`cm_<model>.png`) and training history images (`history_<model>.png`) if the JSONs contain `all_preds`, `all_labels`, and `fold_histories`.
+
+How to run
+----------
+1. Ensure dependencies are installed (project `requirements.txt`):
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Run the generator:
+
+```bash
+python evaluation/generate_charts.py
+```
+
+Troubleshooting
+---------------
+- If `numpy`, `matplotlib`, or `seaborn` are missing, install the environment via `requirements.txt`.
+- If the script warns that a JSON is missing, ensure the filenames in `output/` match the required names above.
+
+Notes
+-----
+- The per-model output filenames are intentionally matched to the keys used by `main.py` (underscores replace hyphens).
+- If you need different input JSON names, edit `evaluation/generate_charts.py` `MODEL_FILES` mapping.
 [← Back to Main README](../README.md)
 
 # evaluation/

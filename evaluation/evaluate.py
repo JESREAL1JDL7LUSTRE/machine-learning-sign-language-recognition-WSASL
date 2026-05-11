@@ -42,6 +42,7 @@ sys.path.insert(0, ROOT)
 from models.lstm              import SignLSTM
 from models.stgcn             import STGCN, NUM_JOINTS
 from models.st_gcn_twostream  import Model as FourStreamSTGCN
+from models.st_gcn_twostream  import Model as ThreeStreamSTGCN
 
 # Preprocessing imports
 from preprocessing.extract    import extract_mp, make_mp_detectors, download_mp_models
@@ -111,7 +112,9 @@ def load_model(num_classes, model_type):
         model = SignLSTM(150, 128, 2, num_classes, 0.3, True).to(DEVICE)
         model_path = os.path.join(ROOT, "models", "sign_lstm.pth")
     elif model_type == "3stream":
-        model = STGCN(num_classes=num_classes).to(DEVICE)
+        # Use the same three-stream wrapper used during training
+        model = ThreeStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"},
+                                 edge_importance_weighting=True, adaptive_graph=True, early_fusion=True).to(DEVICE)
         model_path = os.path.join(ROOT, "models", "sign_stgcn_3stream.pth")
     elif model_type == "4stream-late":
         model = FourStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"}, early_fusion=False).to(DEVICE)
@@ -123,8 +126,32 @@ def load_model(num_classes, model_type):
         raise ValueError(f"Unknown model type: {model_type}")
 
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-        print(f"✅ Loaded weights from {model_path}")
+        ckpt = torch.load(model_path, map_location=DEVICE)
+        # Support checkpoints saved as plain state_dict or wrapped dicts
+        state_dict = None
+        if isinstance(ckpt, dict):
+            # common keys: 'state_dict', 'model_state', 'model'
+            for k in ("state_dict", "model_state", "model"):
+                if k in ckpt:
+                    state_dict = ckpt[k]
+                    break
+        if state_dict is None and not isinstance(ckpt, dict):
+            state_dict = ckpt
+        if state_dict is None and isinstance(ckpt, dict):
+            # maybe the checkpoint IS the state_dict
+            state_dict = ckpt
+
+        try:
+            model.load_state_dict(state_dict)
+            print(f"✅ Loaded weights from {model_path}")
+        except Exception as e:
+            print(f"⚠️  Warning: strict loading failed: {e}")
+            try:
+                model.load_state_dict(state_dict, strict=False)
+                print(f"✅ Loaded weights from {model_path} with strict=False (partial match)")
+            except Exception as e2:
+                print(f"❌ Failed to load checkpoint even with strict=False: {e2}")
+                raise
     else:
         print(f"⚠️  Warning: Weights not found at {model_path}. Using random weights.")
     
@@ -249,7 +276,7 @@ def evaluate_dataset(model_type):
             dataset = ThreeStreamDataset(X_j, X_b, X_m, y)
             def forward_fn(m, batch):
                 xj, xb, xm, _ = batch
-                return m({"joint": xj.to(DEVICE), "bone": xb.to(DEVICE), "motion": xm.to(DEVICE)})
+                return m(xj.to(DEVICE), motion=xm.to(DEVICE), bone=xb.to(DEVICE))
         else:
             dataset = FourStreamDataset(X_j, X_m, X_b, X_bm, y)
             def forward_fn(m, batch):
