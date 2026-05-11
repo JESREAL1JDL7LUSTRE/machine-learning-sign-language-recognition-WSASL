@@ -1,9 +1,9 @@
 """
-train.py — Standalone Training Script for the Four-Stream ST-GCN
-================================================================
+train_4stream_early.py — Standalone Training Script for 4-Stream Early Fusion
+========================================================================
 
 This is the dedicated training script for the FourStreamSTGCN model
-(models/st_gcn_twostream.py) with early fusion.
+with EARLY fusion (early_fusion=True).
 
 Four input streams fed simultaneously:
     joint      — normalized (x,y) joint positions  (N, 2, T, 51)
@@ -11,23 +11,16 @@ Four input streams fed simultaneously:
     bone       — child-minus-parent bone vectors    (N, 2, T, 51)
     bone_motion— frame-to-frame bone delta          (N, 2, T, 51)
 
-Training strategy:
-    - Stratified 85/15 train+val / test split (held-out before CV)
-    - 4-Fold Stratified K-Fold Cross-Validation
-    - Per-fold global z-score normalization (train stats only)
-    - Heavy data augmentation on all four streams simultaneously
-    - Label Smoothing loss with inverse-frequency class weights
-    - AdamW optimizer with warmup-cosine LR schedule
-    - Stochastic Weight Averaging (SWA) from epoch 50
-    - Early stopping with patience=35
-    - Gradient clipping (max_norm=1.0)
-    - Best fold weights saved to models/sign_stgcn.pth
+Outputs:
+    - models/sign_stgcn_4stream_early.pth
+    - output/results_4stream_early.json
+
 
 SWA note: Accumulate weights throughout training, do ONE update_bn at the
 end, evaluate SWA model once after early stopping fires. No per-epoch BN resets.
 """
 
-import os, sys
+import os, sys, json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -41,7 +34,7 @@ sys.path.insert(0, ROOT)
 from models.st_gcn_twostream import Model as FourStreamSTGCN
 
 OUTPUT_DIR    = os.path.join(ROOT, "output")
-MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn.pth")
+MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn_4stream_early.pth")
 
 BATCH_SIZE    = 4
 EPOCHS        = 300
@@ -347,14 +340,17 @@ def load_data():
 
 def eval_model(m, val_loader):
     m.eval()
-    correct = 0
+    all_preds = []
+    all_labels = []
     with torch.no_grad():
         for xj, xmj, xb, xbm, yb in val_loader:
             xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
                                     xbm.to(DEVICE), yb.to(DEVICE))
-            correct += (m(xj, motion=xmj, bone=xb, bone_motion=xbm)
-                        .argmax(1) == yb).sum().item()
-    return correct / len(val_loader.dataset)
+            preds = m(xj, motion=xmj, bone=xb, bone_motion=xbm).argmax(1)
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_labels.extend(yb.cpu().numpy().tolist())
+    correct = sum(1 for p, y in zip(all_preds, all_labels) if p == y)
+    return correct / len(val_loader.dataset), all_preds, all_labels
 
 
 def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
@@ -393,6 +389,9 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
 
     best_val_acc  = 0.0
     best_state    = None
+    best_vp = []
+    best_vl = []
+    history = {'train_acc': [], 'val_acc': []}
     patience_ctr  = 0
     stopped_epoch = EPOCHS
 
@@ -414,6 +413,7 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
             optimizer.step()
             tr_correct += (out.argmax(1) == yb).sum().item()
         tr_acc = tr_correct / len(train_loader.dataset)
+        history["train_acc"].append(tr_acc)
 
         # ── LR schedule ───────────────────────────────────────────────────────
         if epoch >= SWA_START_EP:
@@ -426,10 +426,13 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
             scheduler.step()
 
         # ── Validate base model only (fast, every epoch) ──────────────────────
-        v_acc = eval_model(model, val_loader)
+        v_acc, vp, vl = eval_model(model, val_loader)
 
+        history["val_acc"].append(v_acc)
         if v_acc > best_val_acc:
             best_val_acc = v_acc
+            best_vp = vp
+            best_vl = vl
             best_state   = {k: v.cpu().clone()
                             for k, v in model.state_dict().items()}
             patience_ctr = 0
@@ -453,10 +456,12 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
     if swa_updates >= 5:
         print(f"  Calibrating SWA BN stats ({swa_updates} weight snapshots)...")
         update_bn(train_loader, swa_model, device=DEVICE)
-        v_swa = eval_model(swa_model, val_loader)
+        v_swa, vp_swa, vl_swa = eval_model(swa_model, val_loader)
         print(f"  SWA val acc: {v_swa:.3f}  (base best: {best_val_acc:.3f})")
         if v_swa > best_val_acc:
             best_val_acc = v_swa
+            best_vp = vp_swa
+            best_vl = vl_swa
             best_state = {
                 (k[len("module."):] if k.startswith("module.") else k): v.cpu().clone()
                 for k, v in swa_model.state_dict().items()
@@ -468,7 +473,7 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
         print(f"  SWA skipped (only {swa_updates} updates — early stopping too soon)")
 
     print(f"  Best val acc: {best_val_acc:.3f} (stopped at epoch {stopped_epoch})")
-    return best_val_acc, best_state
+    return best_val_acc, best_state, best_vp, best_vl, history
 
 
 def train():
@@ -507,6 +512,9 @@ def train():
     fold_accs = []
     best_acc  = 0.0
     best_state = None
+    cv_preds = []
+    cv_labels = []
+    fold_histories = []
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(Xj_tv, y_tv), 1):
         Xj_tr_n,  Xj_val_n,  Xj_test_n  = global_normalize(
@@ -518,11 +526,14 @@ def train():
         Xbm_tr_n, Xbm_val_n, Xbm_test_n = global_normalize(
             Xbm_tv[tr_idx], Xbm_tv[val_idx], Xbm_test)
 
-        val_acc, state = train_fold(
+        val_acc, state, vp, vl, hist = train_fold(
             Xj_tr_n, Xm_tr_n, Xb_tr_n, Xbm_tr_n, y_tv[tr_idx],
             Xj_val_n, Xm_val_n, Xb_val_n, Xbm_val_n, y_tv[val_idx],
             num_classes, fold)
         fold_accs.append(val_acc)
+        cv_preds.extend(vp)
+        cv_labels.extend(vl)
+        fold_histories.append(hist)
         print(f"  Fold {fold} best val acc: {val_acc:.3f}")
 
         if val_acc > best_acc:
@@ -551,14 +562,16 @@ def train():
                           y_test, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    tc = 0
     model.eval()
+    test_preds = []
+    test_labels = []
     with torch.no_grad():
         for xj, xmj, xb, xbm, yb in test_loader:
-            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
-                                    xbm.to(DEVICE), yb.to(DEVICE))
-            tc += (model(xj, motion=xmj, bone=xb, bone_motion=xbm)
-                   .argmax(1) == yb).sum().item()
+            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE), xbm.to(DEVICE), yb.to(DEVICE))
+            preds = model(xj, motion=xmj, bone=xb, bone_motion=xbm).argmax(1)
+            test_preds.extend(preds.cpu().numpy().tolist())
+            test_labels.extend(yb.cpu().numpy().tolist())
+    tc = sum(1 for p, y in zip(test_preds, test_labels) if p == y)
 
     print(f"\n── Final Test Set Evaluation ───────────────────────")
     print(f"   Test Accuracy : {tc/len(y_test):.3f}  ({tc}/{len(y_test)} correct)")
@@ -566,6 +579,33 @@ def train():
     print(f"   CV Mean       : {np.mean(fold_accs):.3f} +/- {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
     print(f"   Model saved   : {MODEL_SAVE}")
+
+    # Load label map
+    lmap_path = os.path.join(OUTPUT_DIR, "label_map.json")
+    if os.path.exists(lmap_path):
+        with open(lmap_path, 'r') as f:
+            lmap = json.load(f)
+    else:
+        lmap = {str(i): i for i in range(num_classes)}
+
+    results = {
+        "fold_accs": fold_accs,
+        "cv_mean": float(np.mean(fold_accs)),
+        "cv_std": float(np.std(fold_accs)),
+        "test_acc": float(tc/len(y_test)),
+        "all_preds": test_preds,
+        "all_labels": test_labels,
+        "cv_preds": cv_preds,
+        "cv_labels": cv_labels,
+        "num_classes": num_classes,
+        "fold_histories": fold_histories,
+        "label_map": lmap
+    }
+    
+    out_json = os.path.join(OUTPUT_DIR, "results_4stream_early.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"   JSON saved    : {out_json}")
 
 
 if __name__ == "__main__":

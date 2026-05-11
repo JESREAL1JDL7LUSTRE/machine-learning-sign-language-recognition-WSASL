@@ -112,13 +112,13 @@ def load_model(num_classes, model_type):
         model_path = os.path.join(ROOT, "models", "sign_lstm.pth")
     elif model_type == "3stream":
         model = STGCN(num_classes=num_classes).to(DEVICE)
-        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+        model_path = os.path.join(ROOT, "models", "sign_stgcn_3stream.pth")
     elif model_type == "4stream-late":
         model = FourStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"}, early_fusion=False).to(DEVICE)
-        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+        model_path = os.path.join(ROOT, "models", "sign_stgcn_4stream_late.pth")
     elif model_type == "4stream-early":
         model = FourStreamSTGCN(2, num_classes, {"layout": "mediapipe_51", "strategy": "spatial"}, early_fusion=True).to(DEVICE)
-        model_path = os.path.join(ROOT, "models", "sign_stgcn.pth")
+        model_path = os.path.join(ROOT, "models", "sign_stgcn_4stream_early.pth")
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -284,12 +284,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate or run inference on sign language models")
     parser.add_argument("--video", type=str, default=None,
                         help="Path to a single video for inference")
-    parser.add_argument("--model", type=str, default="4stream-early",
-                        choices=["lstm", "3stream", "4stream-late", "4stream-early"],
-                        help="Model architecture to use (default: 4stream-early)")
+    parser.add_argument("--model", type=str, default="all",
+                        choices=["lstm", "3stream", "4stream-late", "4stream-early", "all"],
+                        help="Model architecture to use (default: all)")
     args = parser.parse_args()
 
     if args.video:
+        if args.model == "all":
+            print("❌ Cannot use --model all for single video inference. Please specify one model.")
+            sys.exit(1)
+            
         label_map_path = os.path.join(OUTPUT_DIR, "label_map.json")
         with open(label_map_path) as f:
             label_map = json.load(f)
@@ -300,4 +304,10 @@ if __name__ == "__main__":
         print(f" Predicted class: {result}")
         print(f"====================================")
     else:
-        evaluate_dataset(args.model)
+        if args.model == "all":
+            print("🚀 Running evaluation for all ST-GCN models...")
+            evaluate_dataset("3stream")
+            evaluate_dataset("4stream-late")
+            evaluate_dataset("4stream-early")
+        else:
+            evaluate_dataset(args.model)

@@ -1,33 +1,24 @@
 """
-train.py — Standalone Training Script for the Four-Stream ST-GCN
+train_3stream.py — Standalone Training Script for 3-Stream ST-GCN
 ================================================================
 
-This is the dedicated training script for the FourStreamSTGCN model
-(models/st_gcn_twostream.py) with early fusion.
+This is the dedicated training script for the ThreeStreamSTGCN model.
 
-Four input streams fed simultaneously:
+Three input streams fed simultaneously:
     joint      — normalized (x,y) joint positions  (N, 2, T, 51)
     motion     — frame-to-frame joint delta         (N, 2, T, 51)
     bone       — child-minus-parent bone vectors    (N, 2, T, 51)
-    bone_motion— frame-to-frame bone delta          (N, 2, T, 51)
 
-Training strategy:
-    - Stratified 85/15 train+val / test split (held-out before CV)
-    - 4-Fold Stratified K-Fold Cross-Validation
-    - Per-fold global z-score normalization (train stats only)
-    - Heavy data augmentation on all four streams simultaneously
-    - Label Smoothing loss with inverse-frequency class weights
-    - AdamW optimizer with warmup-cosine LR schedule
-    - Stochastic Weight Averaging (SWA) from epoch 50
-    - Early stopping with patience=35
-    - Gradient clipping (max_norm=1.0)
-    - Best fold weights saved to models/sign_stgcn.pth
+Outputs:
+    - models/sign_stgcn_3stream.pth
+    - output/results_3stream.json
+
 
 SWA note: Accumulate weights throughout training, do ONE update_bn at the
 end, evaluate SWA model once after early stopping fires. No per-epoch BN resets.
 """
 
-import os, sys
+import os, sys, json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,10 +29,10 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
-from models.st_gcn_twostream import Model as FourStreamSTGCN
+from models.st_gcn_twostream import Model as ThreeStreamSTGCN
 
 OUTPUT_DIR    = os.path.join(ROOT, "output")
-MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn.pth")
+MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn_3stream.pth")
 
 BATCH_SIZE    = 4
 EPOCHS        = 300
@@ -131,7 +122,7 @@ def compute_class_weights(y, num_classes, device):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def augment_4streams(xj, xm, xb, xbm):
+def augment_streams(xj, xm, xb):
     T, F = xj.shape
     V = F // 2
 
@@ -139,14 +130,14 @@ def augment_4streams(xj, xm, xb, xbm):
         xj = xj + np.random.randn(*xj.shape).astype(np.float32) * 0.015
         xm = xm + np.random.randn(*xm.shape).astype(np.float32) * 0.015
         xb = xb + np.random.randn(*xb.shape).astype(np.float32) * 0.015
-        xbm = xbm + np.random.randn(*xbm.shape).astype(np.float32) * 0.015
+        
 
     if np.random.rand() < 0.5:
         scale = np.random.uniform(0.8, 1.2)
         xj = xj * scale
         xm = xm * scale
         xb = xb * scale
-        xbm = xbm * scale
+        
 
     if np.random.rand() < 0.5:
         a = np.random.uniform(-20, 20) * np.pi / 180
@@ -161,13 +152,13 @@ def augment_4streams(xj, xm, xb, xbm):
         xj = apply_rot(xj)
         xm = apply_rot(xm)
         xb = apply_rot(xb)
-        xbm = apply_rot(xbm)
+        
 
     if np.random.rand() < 0.5:
         xj[:, 0::2] = -xj[:, 0::2]
         xm[:, 0::2] = -xm[:, 0::2]
         xb[:, 0::2] = -xb[:, 0::2]
-        xbm[:, 0::2] = -xbm[:, 0::2]
+        
 
     if np.random.rand() < 0.4:
         mask = np.random.rand(T) > 0.15
@@ -176,13 +167,13 @@ def augment_4streams(xj, xm, xb, xbm):
             xj = xj[mask][idx]
             xm = xm[mask][idx]
             xb = xb[mask][idx]
-            xbm = xbm[mask][idx]
+            
 
     if np.random.rand() < 0.4:
         warp = np.cumsum(np.abs(np.random.randn(T)) + 0.5)
         idx = np.clip((warp/warp[-1]*(T-1)).astype(int), 0, T-1)
         xj = xj[idx]; xm = xm[idx]
-        xb = xb[idx]; xbm = xbm[idx]
+        xb = xb[idx]; 
 
     if np.random.rand() < 0.4:
         cl = int(T * np.random.uniform(0.75, 1.0))
@@ -191,7 +182,7 @@ def augment_4streams(xj, xm, xb, xbm):
         xj = xj[st:st+cl][idx]
         xm = xm[st:st+cl][idx]
         xb = xb[st:st+cl][idx]
-        xbm = xbm[st:st+cl][idx]
+        
 
     if np.random.rand() < 0.35:
         angle_candidate = [-10.0, -5.0, 0.0, 5.0, 10.0]
@@ -220,7 +211,7 @@ def augment_4streams(xj, xm, xb, xbm):
         xj2 = xj.reshape(T, V, 2)
         xm2 = xm.reshape(T, V, 2)
         xb2 = xb.reshape(T, V, 2)
-        xbm2 = xbm.reshape(T, V, 2)
+        
 
         for i in range(T):
             ca, sa = np.cos(a_seq[i]) * s_seq[i], np.sin(a_seq[i]) * s_seq[i]
@@ -232,33 +223,22 @@ def augment_4streams(xj, xm, xb, xbm):
 
             xm2[i] = (rot @ xm2[i].T).T
             xb2[i] = (rot @ xb2[i].T).T
-            xbm2[i] = (rot @ xbm2[i].T).T
+            
 
         xj = xj2.reshape(T, F)
         xm = xm2.reshape(T, F)
         xb = xb2.reshape(T, F)
-        xbm = xbm2.reshape(T, F)
+        
 
-    return xj.astype(np.float32), xm.astype(np.float32), xb.astype(np.float32), xbm.astype(np.float32)
+    return xj.astype(np.float32), xm.astype(np.float32), xb.astype(np.float32)
 
 
-class FourStreamDataset(Dataset):
-    """PyTorch Dataset for four-stream skeleton data (joint, motion, bone, bone_motion).
-
-    Each sample returns four graph-format tensors, one per stream, plus the label.
-    The to_graph() method reshapes flat (T, F) sequences to (2, T, V) graph format
-    required by the ST-GCN model.
-
-    Args:
-        X_joint, X_motion, X_bone, X_bone_motion: Each shape (N, T, 102).
-        y       (np.ndarray): Integer labels, shape (N,).
-        augment (bool)      : Apply heavy augmentation if True (training only).
-    """
-    def __init__(self, X_joint, X_motion, X_bone, X_bone_motion, y, augment=False):
+class ThreeStreamDataset(Dataset):
+    def __init__(self, X_joint, X_motion, X_bone, y, augment=False):
         self.X_joint = X_joint.astype(np.float32)
         self.X_motion = X_motion.astype(np.float32)
         self.X_bone  = X_bone.astype(np.float32)
-        self.X_bm    = X_bone_motion.astype(np.float32)
+        
         self.y       = y.astype(np.int64)
         self.augment = augment
 
@@ -286,14 +266,13 @@ class FourStreamDataset(Dataset):
         xj = self.X_joint[idx].copy()
         xmj = self.X_motion[idx].copy()
         xb = self.X_bone[idx].copy()
-        xbm = self.X_bm[idx].copy()
+        
         if self.augment:
-            xj, xmj, xb, xbm = augment_4streams(xj, xmj, xb, xbm)
+            xj, xmj, xb = augment_streams(xj, xmj, xb)
         # Convert all streams to (2, T, V) graph tensors
         return (torch.tensor(self.to_graph(xj),  dtype=torch.float32),
                 torch.tensor(self.to_graph(xmj), dtype=torch.float32),
                 torch.tensor(self.to_graph(xb),  dtype=torch.float32),
-                torch.tensor(self.to_graph(xbm), dtype=torch.float32),
                 torch.tensor(self.y[idx],         dtype=torch.long))
 
 
@@ -347,28 +326,30 @@ def load_data():
 
 def eval_model(m, val_loader):
     m.eval()
-    correct = 0
+    all_preds = []
+    all_labels = []
     with torch.no_grad():
-        for xj, xmj, xb, xbm, yb in val_loader:
-            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
-                                    xbm.to(DEVICE), yb.to(DEVICE))
-            correct += (m(xj, motion=xmj, bone=xb, bone_motion=xbm)
-                        .argmax(1) == yb).sum().item()
-    return correct / len(val_loader.dataset)
+        for xj, xmj, xb, yb in val_loader:
+            xj, xmj, xb, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE))
+            preds = m(xj, motion=xmj, bone=xb).argmax(1)
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_labels.extend(yb.cpu().numpy().tolist())
+    correct = sum(1 for p, y in zip(all_preds, all_labels) if p == y)
+    return correct / len(val_loader.dataset), all_preds, all_labels
 
 
-def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
-               Xj_val, Xm_val, Xb_val, Xbm_val, y_val,
+def train_fold(Xj_tr, Xm_tr, Xb_tr, y_tr,
+               Xj_val, Xm_val, Xb_val, y_val,
                num_classes, fold):
 
     train_loader = DataLoader(
-        FourStreamDataset(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr, augment=True),
+        ThreeStreamDataset(Xj_tr, Xm_tr, Xb_tr, y_tr, augment=True),
         batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True)
     val_loader = DataLoader(
-        FourStreamDataset(Xj_val, Xm_val, Xb_val, Xbm_val, y_val, augment=False),
+        ThreeStreamDataset(Xj_val, Xm_val, Xb_val, y_val, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
 
-    model = FourStreamSTGCN(
+    model = ThreeStreamSTGCN(
         2, num_classes, GRAPH_ARGS,
         edge_importance_weighting=True, adaptive_graph=ADAPTIVE_GRAPH,
         drop_graph_prob=DROP_GRAPH_PROB, early_fusion=EARLY_FUSION,
@@ -393,6 +374,9 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
 
     best_val_acc  = 0.0
     best_state    = None
+    best_vp = []
+    best_vl = []
+    history = {'train_acc': [], 'val_acc': []}
     patience_ctr  = 0
     stopped_epoch = EPOCHS
 
@@ -404,16 +388,16 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         tr_correct = 0
-        for xj, xmj, xb, xbm, yb in train_loader:
-            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
-                                    xbm.to(DEVICE), yb.to(DEVICE))
+        for xj, xmj, xb, yb in train_loader:
+            xj, xmj, xb, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE))
             optimizer.zero_grad()
-            out = model(xj, motion=xmj, bone=xb, bone_motion=xbm)
+            out = model(xj, motion=xmj, bone=xb)
             criterion(out, yb).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             tr_correct += (out.argmax(1) == yb).sum().item()
         tr_acc = tr_correct / len(train_loader.dataset)
+        history["train_acc"].append(tr_acc)
 
         # ── LR schedule ───────────────────────────────────────────────────────
         if epoch >= SWA_START_EP:
@@ -426,10 +410,13 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
             scheduler.step()
 
         # ── Validate base model only (fast, every epoch) ──────────────────────
-        v_acc = eval_model(model, val_loader)
+        v_acc, vp, vl = eval_model(model, val_loader)
 
+        history["val_acc"].append(v_acc)
         if v_acc > best_val_acc:
             best_val_acc = v_acc
+            best_vp = vp
+            best_vl = vl
             best_state   = {k: v.cpu().clone()
                             for k, v in model.state_dict().items()}
             patience_ctr = 0
@@ -453,10 +440,12 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
     if swa_updates >= 5:
         print(f"  Calibrating SWA BN stats ({swa_updates} weight snapshots)...")
         update_bn(train_loader, swa_model, device=DEVICE)
-        v_swa = eval_model(swa_model, val_loader)
+        v_swa, vp_swa, vl_swa = eval_model(swa_model, val_loader)
         print(f"  SWA val acc: {v_swa:.3f}  (base best: {best_val_acc:.3f})")
         if v_swa > best_val_acc:
             best_val_acc = v_swa
+            best_vp = vp_swa
+            best_vl = vl_swa
             best_state = {
                 (k[len("module."):] if k.startswith("module.") else k): v.cpu().clone()
                 for k, v in swa_model.state_dict().items()
@@ -468,7 +457,7 @@ def train_fold(Xj_tr, Xm_tr, Xb_tr, Xbm_tr, y_tr,
         print(f"  SWA skipped (only {swa_updates} updates — early stopping too soon)")
 
     print(f"  Best val acc: {best_val_acc:.3f} (stopped at epoch {stopped_epoch})")
-    return best_val_acc, best_state
+    return best_val_acc, best_state, best_vp, best_vl, history
 
 
 def train():
@@ -476,7 +465,7 @@ def train():
     X_joint, X_motion, X_bone, X_bm, y = load_data()
     num_classes = len(np.unique(y))
 
-    _m = FourStreamSTGCN(2, num_classes, GRAPH_ARGS,
+    _m = ThreeStreamSTGCN(2, num_classes, GRAPH_ARGS,
         edge_importance_weighting=True, adaptive_graph=ADAPTIVE_GRAPH,
         drop_graph_prob=DROP_GRAPH_PROB, early_fusion=EARLY_FUSION,
         dropout=DROPOUT)
@@ -492,10 +481,10 @@ def train():
                                         random_state=SEED, stratify=y)
     Xj_test  = X_joint[idx_test]; Xb_test  = X_bone[idx_test]
     Xm_test  = X_motion[idx_test]
-    Xbm_test = X_bm[idx_test];    y_test   = y[idx_test]
+    y_test   = y[idx_test]
     Xj_tv    = X_joint[idx_tv];   Xb_tv    = X_bone[idx_tv]
     Xm_tv    = X_motion[idx_tv]
-    Xbm_tv   = X_bm[idx_tv];      y_tv     = y[idx_tv]
+    y_tv     = y[idx_tv]
 
     np.save(os.path.join(OUTPUT_DIR, "X_test.npy"), Xj_test)
     np.save(os.path.join(OUTPUT_DIR, "y_test.npy"), y_test)
@@ -507,6 +496,9 @@ def train():
     fold_accs = []
     best_acc  = 0.0
     best_state = None
+    cv_preds = []
+    cv_labels = []
+    fold_histories = []
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(Xj_tv, y_tv), 1):
         Xj_tr_n,  Xj_val_n,  Xj_test_n  = global_normalize(
@@ -515,14 +507,16 @@ def train():
             Xm_tv[tr_idx],  Xm_tv[val_idx],  Xm_test)
         Xb_tr_n,  Xb_val_n,  Xb_test_n  = global_normalize(
             Xb_tv[tr_idx],  Xb_tv[val_idx],  Xb_test)
-        Xbm_tr_n, Xbm_val_n, Xbm_test_n = global_normalize(
-            Xbm_tv[tr_idx], Xbm_tv[val_idx], Xbm_test)
+        
 
-        val_acc, state = train_fold(
-            Xj_tr_n, Xm_tr_n, Xb_tr_n, Xbm_tr_n, y_tv[tr_idx],
-            Xj_val_n, Xm_val_n, Xb_val_n, Xbm_val_n, y_tv[val_idx],
+        val_acc, state, vp, vl, hist = train_fold(
+            Xj_tr_n, Xm_tr_n, Xb_tr_n, y_tv[tr_idx],
+            Xj_val_n, Xm_val_n, Xb_val_n, y_tv[val_idx],
             num_classes, fold)
         fold_accs.append(val_acc)
+        cv_preds.extend(vp)
+        cv_labels.extend(vl)
+        fold_histories.append(hist)
         print(f"  Fold {fold} best val acc: {val_acc:.3f}")
 
         if val_acc > best_acc:
@@ -531,7 +525,7 @@ def train():
             best_Xj_test  = Xj_test_n
             best_Xm_test  = Xm_test_n
             best_Xb_test  = Xb_test_n
-            best_Xbm_test = Xbm_test_n
+            
 
     print(f"\n── K-Fold Results ──────────────────────────────────")
     for i, a in enumerate(fold_accs, 1):
@@ -539,7 +533,7 @@ def train():
     print(f"   Mean  : {np.mean(fold_accs):.3f} +/- {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
 
-    model = FourStreamSTGCN(2, num_classes, GRAPH_ARGS,
+    model = ThreeStreamSTGCN(2, num_classes, GRAPH_ARGS,
         edge_importance_weighting=True, adaptive_graph=ADAPTIVE_GRAPH,
         drop_graph_prob=DROP_GRAPH_PROB, early_fusion=EARLY_FUSION,
         dropout=DROPOUT).to(DEVICE)
@@ -547,18 +541,19 @@ def train():
     torch.save(best_state, MODEL_SAVE)
 
     test_loader = DataLoader(
-        FourStreamDataset(best_Xj_test, best_Xm_test, best_Xb_test, best_Xbm_test,
-                          y_test, augment=False),
+        ThreeStreamDataset(best_Xj_test, best_Xm_test, best_Xb_test, y_test, augment=False),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    tc = 0
     model.eval()
+    test_preds = []
+    test_labels = []
     with torch.no_grad():
-        for xj, xmj, xb, xbm, yb in test_loader:
-            xj, xmj, xb, xbm, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE),
-                                    xbm.to(DEVICE), yb.to(DEVICE))
-            tc += (model(xj, motion=xmj, bone=xb, bone_motion=xbm)
-                   .argmax(1) == yb).sum().item()
+        for xj, xmj, xb, yb in test_loader:
+            xj, xmj, xb, yb = (xj.to(DEVICE), xmj.to(DEVICE), xb.to(DEVICE), yb.to(DEVICE))
+            preds = model(xj, motion=xmj, bone=xb).argmax(1)
+            test_preds.extend(preds.cpu().numpy().tolist())
+            test_labels.extend(yb.cpu().numpy().tolist())
+    tc = sum(1 for p, y in zip(test_preds, test_labels) if p == y)
 
     print(f"\n── Final Test Set Evaluation ───────────────────────")
     print(f"   Test Accuracy : {tc/len(y_test):.3f}  ({tc}/{len(y_test)} correct)")
@@ -566,6 +561,33 @@ def train():
     print(f"   CV Mean       : {np.mean(fold_accs):.3f} +/- {np.std(fold_accs):.3f}")
     print(f"───────────────────────────────────────────────────")
     print(f"   Model saved   : {MODEL_SAVE}")
+
+    # Load label map
+    lmap_path = os.path.join(OUTPUT_DIR, "label_map.json")
+    if os.path.exists(lmap_path):
+        with open(lmap_path, 'r') as f:
+            lmap = json.load(f)
+    else:
+        lmap = {str(i): i for i in range(num_classes)}
+
+    results = {
+        "fold_accs": fold_accs,
+        "cv_mean": float(np.mean(fold_accs)),
+        "cv_std": float(np.std(fold_accs)),
+        "test_acc": float(tc/len(y_test)),
+        "all_preds": test_preds,
+        "all_labels": test_labels,
+        "cv_preds": cv_preds,
+        "cv_labels": cv_labels,
+        "num_classes": num_classes,
+        "fold_histories": fold_histories,
+        "label_map": lmap
+    }
+    
+    out_json = os.path.join(OUTPUT_DIR, "results_3stream.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"   JSON saved    : {out_json}")
 
 
 if __name__ == "__main__":
