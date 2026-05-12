@@ -40,9 +40,9 @@ sys.path.insert(0, ROOT)
 
 # Model imports
 from models.lstm              import SignLSTM
-from models.stgcn             import STGCN, NUM_JOINTS
-from models.st_gcn_twostream  import Model as FourStreamSTGCN
-from models.st_gcn_twostream  import Model as ThreeStreamSTGCN
+from models.stgcn_multi             import STGCN, NUM_JOINTS
+from models.st_gcn_four_stream  import Model as FourStreamSTGCN
+from models.st_gcn_four_stream  import Model as ThreeStreamSTGCN
 
 # Preprocessing imports
 from preprocessing.extract    import extract_mp, make_mp_detectors, download_mp_models

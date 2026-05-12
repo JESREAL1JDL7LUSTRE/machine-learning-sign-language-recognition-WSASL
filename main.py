@@ -36,9 +36,9 @@ import matplotlib.gridspec as gridspec
 ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
-from models.stgcn               import STGCN, NUM_JOINTS
+from models.stgcn_multi               import STGCN, NUM_JOINTS
 from models.stgcn_2stream_ported import TwoStreamPortedSTGCN
-from models.st_gcn_twostream    import Model as FourStreamSTGCN
+from models.st_gcn_four_stream    import Model as FourStreamSTGCN
 
 # ── Directories ────────────────────────────────────────────────────────────────
 OUTPUT_DIR    = os.path.join(ROOT, "output")

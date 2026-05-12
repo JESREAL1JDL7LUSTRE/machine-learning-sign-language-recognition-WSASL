@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 
 # Import the backbone ST-GCN stream (single-stream model)
-from models.st_gcn import Model as ST_GCN
+from models.st_gcn_backbone import Model as ST_GCN
 
 
 class Model(nn.Module):

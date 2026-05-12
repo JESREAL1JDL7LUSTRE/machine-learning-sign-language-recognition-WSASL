@@ -29,7 +29,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
-from models.st_gcn_twostream import Model as ThreeStreamSTGCN
+from models.st_gcn_four_stream import Model as ThreeStreamSTGCN
 
 OUTPUT_DIR    = os.path.join(ROOT, "output")
 MODEL_SAVE    = os.path.join(ROOT, "models", "sign_stgcn_3stream.pth")

@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import torch
 import torch.nn as nn
 # Import the backbone single-stream ST-GCN
-from models.st_gcn import Model as ST_GCN
+from models.st_gcn_backbone import Model as ST_GCN
 
 
 class TwoStreamPortedSTGCN(nn.Module):
